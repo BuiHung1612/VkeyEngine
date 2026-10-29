@@ -172,6 +172,17 @@ impl Tap {
         unsafe { CGEvent::tap_post_event(self.proxy, Some(ev)) };
     }
 
+    /// Cmd + `key` posted outside the tap callback (copy / paste for "convert selection").
+    /// Our tap skips it: it comes from our event source.
+    pub fn post_command_key(&self, key: u16) {
+        for down in [true, false] {
+            if let Some(ev) = CGEvent::new_keyboard_event(self.source.as_deref(), key, down) {
+                CGEvent::set_flags(Some(&ev), CGEventFlags::MaskCommand);
+                CGEvent::post(CGEventTapLocation::SessionEventTap, Some(&ev));
+            }
+        }
+    }
+
     fn post_key(&self, key: u16, flags: Option<u64>) {
         for down in [true, false] {
             if let Some(ev) = CGEvent::new_keyboard_event(self.source.as_deref(), key, down) {
@@ -356,7 +367,7 @@ fn handle(app: &mut App, proxy: CGEventTapProxy, ty: CGEventType, ev: &CGEvent) 
             if hotkey::key(convert_key) == kc && check_hotkey(convert_key, t.last_flag, kc, true) {
                 t.last_flag = 0;
                 t.has_just_used_hotkey = true;
-                ui::defer(ui::quick_convert);
+                ui::defer(ui::convert_selection);
                 return Outcome::Swallow;
             }
         }
@@ -375,7 +386,7 @@ fn handle(app: &mut App, proxy: CGEventTapProxy, ty: CGEventType, ev: &CGEvent) 
             if check_hotkey(convert_key, t.last_flag, t.keycode, has_key(convert_key)) {
                 t.last_flag = 0;
                 t.has_just_used_hotkey = true;
-                ui::defer(ui::quick_convert);
+                ui::defer(ui::convert_selection);
                 return Outcome::Swallow;
             }
             if app.opt.temp_off_spelling && !t.has_just_used_hotkey && has(t.last_flag, CGEventFlags::MaskControl) {
@@ -449,7 +460,11 @@ fn handle(app: &mut App, proxy: CGEventTapProxy, ty: CGEventType, ev: &CGEvent) 
     }
 
     let kc = app.tap.keycode;
-    app.engine.handle_event(KeyEvent::Keyboard, KeyState::KeyDown, kc, caps_status, other_control_key(flag));
+    // Esc right after a word was changed: give the typed keys back instead of the Esc
+    let undone = kc == KEY_ESC && app.opt.esc_undo && !other_control_key(flag) && app.engine.undo_word();
+    if !undone {
+        app.engine.handle_event(KeyEvent::Keyboard, KeyState::KeyDown, kc, caps_status, other_control_key(flag));
+    }
     let table = app.engine.s.code_table;
     let double = is_double_code(table);
     let compound_app = Tap::uses_compound_workaround(app);
@@ -612,4 +627,7 @@ fn switch_language(app: &mut App) {
         sys::beep();
     }
     app.set_language(lang);
+    if app.opt.mode_hud {
+        ui::defer(ui::show_mode_hud);
+    }
 }

@@ -71,6 +71,9 @@ const WM_REFRESH: u32 = WM_APP + 11;
 const WM_QUICK_CONVERT: u32 = WM_APP + 12;
 const WM_SHOW_SETTINGS: u32 = WM_APP + 13;
 const WM_UPDATE: u32 = WM_APP + 14;
+const WM_MODE_HUD: u32 = WM_APP + 15;
+const TIMER_SELECTION: usize = 2;
+const TIMER_HUD: usize = 3;
 const TIMER_HOOK: usize = 1;
 
 const INPUT_TYPES: [&str; 4] = ["Telex", "VNI", "Simple Telex 1", "Simple Telex 2"];
@@ -112,6 +115,8 @@ static TOGGLES: &[Toggle] = &[
     t("vTempOffSpelling", false, "Tạm tắt kiểm tra chính tả bằng phím Ctrl", P_SPELL),
     t("vAllowConsonantZFWJ", false, "Cho phép phụ âm đầu Z, F, W, J", P_SPELL),
     t("vUseModernOrthography", false, "Đặt dấu kiểu mới (oà, uý thay vì òa, úy)", P_GENERAL),
+    t("vRestoreEnglishWord", true, "Giữ nguyên từ tiếng Anh (boss, good, search…)", P_GENERAL),
+    t("vEscUndo", true, "Bấm Esc để trả lại đúng các phím vừa gõ", P_SPELL),
     t("vQuickTelex", false, "Gõ nhanh: cc→ch gg→gi kk→kh nn→ng qq→qu pp→ph tt→th", P_QUICK),
     t("vQuickStartConsonant", false, "Gõ tắt phụ âm đầu: f→ph j→gi w→qu", P_QUICK),
     t("vQuickEndConsonant", false, "Gõ tắt phụ âm cuối: g→ng h→nh k→ch", P_QUICK),
@@ -121,6 +126,7 @@ static TOGGLES: &[Toggle] = &[
     t("vAutoCapsMacro", false, "Tự viết hoa theo từ gõ tắt (btw → Btw → BTW)", P_MACRO),
     t("vRunWithWindows", true, "Khởi động cùng Windows", P_GENERAL),
     t("vShowOnStartUp", true, "Hiện bảng điều khiển khi khởi động", P_UI),
+    t("vModeHUD", true, "Hiện V / E cạnh con trỏ khi chuyển chế độ", P_UI),
     t("vAutoCheckUpdate", true, "Tự kiểm tra bản mới", P_GENERAL),
     t("vUseSmartSwitchKey", true, "Tự nhớ chế độ gõ Việt / Anh theo từng ứng dụng", P_SMART),
     t("vRememberCode", true, "Tự nhớ bảng mã theo từng ứng dụng", P_SMART),
@@ -159,7 +165,9 @@ fn toggle_on(t: &Toggle) -> bool {
 
 fn toggle_enabled(t: &Toggle) -> bool {
     match t.key {
-        "vRestoreIfWrongSpelling" | "vTempOffSpelling" | "vAllowConsonantZFWJ" => reg::flag("vCheckSpelling", true),
+        "vRestoreIfWrongSpelling" | "vRestoreEnglishWord" | "vTempOffSpelling" | "vAllowConsonantZFWJ" => {
+            reg::flag("vCheckSpelling", true)
+        }
         "vFixChromiumBrowser" => reg::flag("vFixRecommendBrowser", true),
         _ => true,
     }
@@ -690,7 +698,7 @@ pub fn run_app() {
 
         let instance = GetModuleHandleW(null());
         let icon = app_icon(32);
-        for (name, proc_) in [(MAIN_CLASS, main_proc as WndProc), (WIN_CLASS, win_proc as WndProc)] {
+        for (name, proc_) in [(MAIN_CLASS, main_proc as WndProc), (WIN_CLASS, win_proc as WndProc), (HUD_CLASS, hud_proc as WndProc)] {
             let name = wide(name);
             let class = WNDCLASSEXW {
                 cbSize: size_of::<WNDCLASSEXW>() as u32,
@@ -737,6 +745,10 @@ type WndProc = unsafe extern "system" fn(HWND, u32, WPARAM, LPARAM) -> LRESULT;
 
 pub fn post_refresh() {
     unsafe { PostMessageW(main_hwnd(), WM_REFRESH, 0, 0) };
+}
+
+pub fn post_mode_hud() {
+    unsafe { PostMessageW(main_hwnd(), WM_MODE_HUD, 0, 0) };
 }
 
 pub fn post_quick_convert() {
@@ -905,7 +917,15 @@ unsafe extern "system" fn main_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam
             0
         }
         WM_QUICK_CONVERT => {
-            quick_convert(false);
+            convert_selection(); // the hot key
+            0
+        }
+        WM_MODE_HUD => {
+            show_mode_hud();
+            0
+        }
+        WM_TIMER if wparam == TIMER_SELECTION => {
+            selection_step();
             0
         }
         WM_SHOW_SETTINGS => {
@@ -1185,10 +1205,22 @@ fn convert_html(html: &str, opt: &crate::convert::ConvertOptions) -> Option<Stri
 /// Convert the clipboard (plain text and HTML) with the convert tool options.
 fn quick_convert(always_alert: bool) {
     let (_, o) = read_settings();
+    let Some(converted) = convert_clipboard() else { return };
+    if !converted {
+        alert(null_mut(), "Không có dữ liệu trong clipboard!\nHãy sao chép một đoạn văn bản để chuyển mã.");
+    } else if o.convert_alert || always_alert {
+        alert(null_mut(), "Chuyển mã thành công!\nKết quả đã được lưu trong clipboard.");
+    }
+}
+
+/// Convert the clipboard's text and HTML in place: Some(false) if it holds no text, None
+/// if it cannot be opened.
+fn convert_clipboard() -> Option<bool> {
+    let (_, o) = read_settings();
     let html_format = unsafe { RegisterClipboardFormatW(wide("HTML Format").as_ptr()) };
     let (text, html) = unsafe {
         if OpenClipboard(main_hwnd()) == 0 {
-            return;
+            return None;
         }
         let text = clipboard_get(CF_UNICODETEXT as u32).map(|b| {
             let units: Vec<u16> = b.as_chunks::<2>().0.iter().map(|&c| u16::from_le_bytes(c)).take_while(|&u| u != 0).collect();
@@ -1211,10 +1243,108 @@ fn quick_convert(always_alert: bool) {
         CloseClipboard();
         (text, html)
     };
-    if text.is_none() && html.is_none() {
-        alert(null_mut(), "Không có dữ liệu trong clipboard!\nHãy sao chép một đoạn văn bản để chuyển mã.");
-    } else if o.convert_alert || always_alert {
-        alert(null_mut(), "Chuyển mã thành công!\nKết quả đã được lưu trong clipboard.");
+    Some(text.is_some() || html.is_some())
+}
+
+/// Everything on the clipboard (formats backed by global memory), to put it back.
+fn save_clipboard() -> Vec<(u32, Vec<u8>)> {
+    let mut saved = Vec::new();
+    unsafe {
+        if OpenClipboard(main_hwnd()) == 0 {
+            return saved;
+        }
+        let mut format = EnumClipboardFormats(0);
+        while format != 0 {
+            let h = GetClipboardData(format);
+            // GDI handles (bitmaps, metafiles) are not global memory; Windows makes them again
+            // from the DIB / enhanced metafile data saved with the other formats
+            if !h.is_null() && GlobalSize(h) > 0 {
+                if let Some(bytes) = clipboard_get(format) {
+                    saved.push((format, bytes));
+                }
+            }
+            format = EnumClipboardFormats(format);
+        }
+        CloseClipboard();
+    }
+    saved
+}
+
+fn restore_clipboard(saved: &[(u32, Vec<u8>)]) {
+    unsafe {
+        if OpenClipboard(main_hwnd()) == 0 {
+            return;
+        }
+        EmptyClipboard();
+        for (format, bytes) in saved {
+            clipboard_set(*format, bytes);
+        }
+        CloseClipboard();
+    }
+}
+
+/// "Convert selection" in progress (see `convert_selection`).
+struct SelectionJob {
+    saved: Vec<(u32, Vec<u8>)>,
+    start: u32,
+    phase: u8,
+    ticks: u32,
+}
+
+thread_local! {
+    static SELECTION: RefCell<Option<SelectionJob>> = const { RefCell::new(None) };
+}
+
+/// Convert hot key: convert the selected text in place (copy, convert, paste, then put the
+/// clipboard back). With nothing selected, convert the clipboard as before.
+fn convert_selection() {
+    let job = SelectionJob { saved: save_clipboard(), start: unsafe { GetClipboardSequenceNumber() }, phase: 0, ticks: 0 };
+    SELECTION.with(|s| *s.borrow_mut() = Some(job));
+    unsafe { SetTimer(main_hwnd(), TIMER_SELECTION, 50, None) };
+}
+
+fn selection_step() {
+    let stop = || unsafe {
+        KillTimer(main_hwnd(), TIMER_SELECTION);
+    };
+    let Some((phase, ticks, start)) = SELECTION.with(|s| {
+        s.borrow_mut().as_mut().map(|j| {
+            j.ticks += 1;
+            (j.phase, j.ticks, j.start)
+        })
+    }) else {
+        stop();
+        return;
+    };
+    let set_phase = |p: u8| SELECTION.with(|s| s.borrow_mut().as_mut().map(|j| (j.phase, j.ticks) = (p, 0)));
+    match phase {
+        // wait until the hot key's modifiers are up: the app would see them with our Ctrl+C
+        0 => {
+            let down = |vk: u16| unsafe { GetAsyncKeyState(vk as i32) } < 0;
+            if [VK_CONTROL, VK_MENU, VK_SHIFT, VK_LWIN, VK_RWIN].into_iter().any(down) && ticks < 30 {
+                return;
+            }
+            hook::send_ctrl_key(0x43); // C
+            set_phase(1);
+        }
+        1 if unsafe { GetClipboardSequenceNumber() } != start => {
+            if convert_clipboard() == Some(true) {
+                hook::send_ctrl_key(0x56); // V
+            }
+            set_phase(2);
+        }
+        1 if ticks > 10 => {
+            stop(); // nothing selected
+            SELECTION.with(|s| s.borrow_mut().take());
+            quick_convert(false);
+        }
+        2 if ticks >= 8 => {
+            stop();
+            if let Some(job) = SELECTION.with(|s| s.borrow_mut().take()) {
+                restore_clipboard(&job.saved);
+            }
+        }
+        _ => {}
     }
 }
 
@@ -2297,5 +2427,97 @@ fn install_update(url: &str) {
         Ok(()) => UpdateEvent::Ready,
         Err(e) => UpdateEvent::Failed(e),
     });
+}
+
+// ---------------------------------------------------------------- mode badge
+
+const HUD_CLASS: &str = "VKeyEngineHud";
+const HUD_W: f32 = 34.0;
+const HUD_H: f32 = 26.0;
+
+thread_local! {
+    /// badge window, its text, and fade ticks / alpha
+    static HUD: RefCell<(HWND, &'static str, u32, u8)> = const { RefCell::new((null_mut(), "V", 0, 255)) };
+}
+
+/// Briefly show V or E next to the text caret (or the mouse pointer when the app does not
+/// say where its caret is), then fade out.
+fn show_mode_hud() {
+    unsafe {
+        let mut hwnd = HUD.with(|h| h.borrow().0);
+        if hwnd.is_null() {
+            let ex = WS_EX_LAYERED | WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE | WS_EX_TRANSPARENT;
+            hwnd = CreateWindowExW(ex, wide(HUD_CLASS).as_ptr(), null(), WS_POPUP, 0, 0, 10, 10, null_mut(), null_mut(), GetModuleHandleW(null()), null());
+            HUD.with(|h| h.borrow_mut().0 = hwnd);
+        }
+        let s = scale(hwnd);
+        let (w, h) = ((HUD_W * s) as i32, (HUD_H * s) as i32);
+        let mut info = GUITHREADINFO { cbSize: size_of::<GUITHREADINFO>() as u32, ..std::mem::zeroed() };
+        let thread = GetWindowThreadProcessId(GetForegroundWindow(), null_mut());
+        let mut at = POINT { x: 0, y: 0 };
+        if GetGUIThreadInfo(thread, &mut info) != 0 && !info.hwndCaret.is_null() {
+            at = POINT { x: info.rcCaret.right, y: info.rcCaret.top };
+            ClientToScreen(info.hwndCaret, &mut at);
+            let caret_h = info.rcCaret.bottom - info.rcCaret.top;
+            at = POINT { x: at.x + (6.0 * s) as i32, y: at.y + caret_h / 2 - h / 2 };
+        } else {
+            GetCursorPos(&mut at);
+            at = POINT { x: at.x + (14.0 * s) as i32, y: at.y + (18.0 * s) as i32 };
+        }
+        let text = if read_settings().0.language == 1 { "V" } else { "E" };
+        HUD.with(|hud| {
+            let mut hud = hud.borrow_mut();
+            (hud.1, hud.2, hud.3) = (text, 0, 255);
+        });
+        let radius = (14.0 * s) as i32;
+        SetWindowRgn(hwnd, CreateRoundRectRgn(0, 0, w + 1, h + 1, radius, radius), 0);
+        SetLayeredWindowAttributes(hwnd, 0, 255, LWA_ALPHA);
+        SetWindowPos(hwnd, HWND_TOPMOST, at.x, at.y, w, h, SWP_NOACTIVATE | SWP_SHOWWINDOW);
+        InvalidateRect(hwnd, null(), 0);
+        SetTimer(hwnd, TIMER_HUD, 50, None);
+    }
+}
+
+unsafe extern "system" fn hud_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+    match msg {
+        WM_PAINT => {
+            let t = theme();
+            let text = HUD.with(|h| h.borrow().1);
+            let mut ps: PAINTSTRUCT = std::mem::zeroed();
+            let hdc = BeginPaint(hwnd, &mut ps);
+            let mut rc = RECT { left: 0, top: 0, right: 0, bottom: 0 };
+            GetClientRect(hwnd, &mut rc);
+            let bg = CreateSolidBrush(colorref(t.accent)); // black in light mode, white in dark mode
+            FillRect(hdc, &rc, bg);
+            DeleteObject(bg);
+            SetBkMode(hdc, TRANSPARENT as i32);
+            SetTextColor(hdc, colorref(t.on_accent));
+            SelectObject(hdc, font(15.0, true, scale(hwnd)));
+            let mut w: Vec<u16> = text.encode_utf16().collect();
+            DrawTextW(hdc, w.as_mut_ptr(), w.len() as i32, &mut rc, DT_SINGLELINE | DT_VCENTER | DT_CENTER | DT_NOPREFIX);
+            EndPaint(hwnd, &ps);
+            0
+        }
+        WM_TIMER if wparam == TIMER_HUD => {
+            // 0.6 s fully visible, then fade out
+            let alpha = HUD.with(|h| {
+                let mut h = h.borrow_mut();
+                h.2 += 1;
+                if h.2 > 12 {
+                    h.3 = h.3.saturating_sub(51);
+                }
+                h.3
+            });
+            if alpha == 0 {
+                KillTimer(hwnd, TIMER_HUD);
+                ShowWindow(hwnd, SW_HIDE);
+            } else {
+                SetLayeredWindowAttributes(hwnd, 0, alpha, LWA_ALPHA);
+            }
+            0
+        }
+        WM_NCHITTEST => HTTRANSPARENT as LRESULT,
+        _ => DefWindowProcW(hwnd, msg, wparam, lparam),
+    }
 }
 

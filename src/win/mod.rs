@@ -67,6 +67,10 @@ pub struct Options {
     pub convert: ConvertOptions,
     pub convert_alert: bool,
     pub convert_hotkey: i64,
+    /// Esc right after a word was changed gives the typed keys back
+    pub esc_undo: bool,
+    /// show V / E next to the caret when switching mode
+    pub mode_hud: bool,
 }
 
 pub struct App {
@@ -106,6 +110,7 @@ pub fn read_settings() -> (Settings, Options) {
         allow_consonant_zfwj: flag("vAllowConsonantZFWJ", false),
         quick_start_consonant: flag("vQuickStartConsonant", false),
         quick_end_consonant: flag("vQuickEndConsonant", false),
+        restore_english: flag("vRestoreEnglishWord", true),
     };
     // OpenKey for Windows wrote the macOS default (key code 6, which no key sends) on a
     // fresh install, so that value means "default" too.
@@ -138,6 +143,8 @@ pub fn read_settings() -> (Settings, Options) {
         // the value name is historical: it stores "alert when completed"
         convert_alert: flag("convertToolDontAlertWhenCompleted", false),
         convert_hotkey,
+        esc_undo: flag("vEscUndo", true),
+        mode_hud: flag("vModeHUD", true),
     };
     (s, o)
 }

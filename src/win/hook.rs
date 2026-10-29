@@ -320,6 +320,19 @@ fn switch_language(app: &mut App) {
     }
     let lang = 1 - app.engine.s.language.min(1);
     app.set_language(lang);
+    if app.opt.mode_hud {
+        ui::post_mode_hud();
+    }
+}
+
+/// Ctrl + `vk` (copy / paste for "convert selection"); the hook skips our own events.
+pub fn send_ctrl_key(vk: u16) {
+    send(&[
+        key_input(VK_CONTROL, 0, 0),
+        key_input(vk, 0, 0),
+        key_input(vk, 0, KEYEVENTF_KEYUP),
+        key_input(VK_CONTROL, 0, KEYEVENTF_KEYUP),
+    ]);
 }
 
 /// Returns true to swallow the key.
@@ -431,7 +444,11 @@ fn handle_key(app: &mut App, msg: u32, vk: u16) -> bool {
         return false;
     }
 
-    app.engine.handle_event(KeyEvent::Keyboard, KeyState::KeyDown, ek, caps_status, other_control_key);
+    // Esc right after a word was changed: give the typed keys back instead of the Esc
+    let undone = vk == VK_ESCAPE && app.opt.esc_undo && !other_control_key && app.engine.undo_word();
+    if !undone {
+        app.engine.handle_event(KeyEvent::Keyboard, KeyState::KeyDown, ek, caps_status, other_control_key);
+    }
     let table = app.engine.s.code_table;
     let double = is_double_code(table);
     match app.engine.hook.code {

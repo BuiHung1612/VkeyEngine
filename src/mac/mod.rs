@@ -63,6 +63,10 @@ pub struct Options {
     pub convert: ConvertOptions,
     pub convert_alert: bool,
     pub convert_hotkey: i64,
+    /// Esc right after a word was changed gives the typed keys back
+    pub esc_undo: bool,
+    /// show V / E next to the caret when switching mode
+    pub mode_hud: bool,
 }
 
 pub struct App {
@@ -106,6 +110,7 @@ pub fn read_settings() -> (Settings, Options) {
         allow_consonant_zfwj: flag("vAllowConsonantZFWJ", false),
         quick_start_consonant: flag("vQuickStartConsonant", false),
         quick_end_consonant: flag("vQuickEndConsonant", false),
+        restore_english: flag("RestoreEnglishWord", true),
     };
     let mut switch_key = int("SwitchKeyStatus", DEFAULT_SWITCH_KEY);
     if switch_key == 0 {
@@ -138,6 +143,8 @@ pub fn read_settings() -> (Settings, Options) {
         // the pref name is historical: it stores "alert when completed"
         convert_alert: flag("convertToolDontAlertWhenCompleted", false),
         convert_hotkey,
+        esc_undo: flag("EscUndo", true),
+        mode_hud: flag("ModeHUD", true),
     };
     (s, o)
 }

@@ -3,6 +3,7 @@ use vkeyengine::engine::*;
 
 
 use vkeyengine::sim::type_with;
+use vkeyengine::tables::key_to_char;
 
 fn typ(input: &str) -> String {
     type_with(&mut Engine::default(), input)
@@ -220,4 +221,38 @@ fn convert_roundtrip_all_tables() {
             assert_eq!(back, text, "table {t}");
         }
     }
+}
+
+#[test]
+fn english_words_typed_with_telex_come_back() {
+    let s = Settings { restore_english: true, ..Settings::default() };
+    let t = |input: &str| type_with(&mut Engine::new(s.clone()), input);
+    assert_eq!(t("boss "), "boss ");
+    assert_eq!(t("good "), "good ");
+    assert_eq!(t("coffee, "), "coffee, ");
+    assert_eq!(t("Windows "), "Windows ");
+    // still Vietnamese
+    assert_eq!(t("nguowif "), "người ");
+    assert_eq!(t("tieengs Vieejt "), "tiếng Việt ");
+    // English and a valid Vietnamese syllable: Vietnamese wins
+    assert_eq!(t("this "), "thí ");
+    // an invalid word that is not English is left alone (as without the option)
+    let off = type_with(&mut Engine::new(Settings::default()), "asdf ");
+    assert_eq!(t("asdf "), off);
+}
+
+#[test]
+fn undo_word_gives_the_keys_back() {
+    let mut e = Engine::new(Settings::default());
+    assert_eq!(type_with(&mut e, "vieejt"), "việt");
+    assert!(e.undo_word());
+    assert_eq!(e.hook.backspace_count, 4);
+    assert_eq!(e.hook.new_char_count, 6);
+    let typed: String =
+        (0..6).rev().map(|i| char::from_u32(key_to_char(e.hook.char_data[i]) as u32).unwrap()).collect();
+    assert_eq!(typed, "vieejt");
+    // a word shown as typed has nothing to undo
+    let mut e = Engine::new(Settings::default());
+    type_with(&mut e, "ban");
+    assert!(!e.undo_word());
 }

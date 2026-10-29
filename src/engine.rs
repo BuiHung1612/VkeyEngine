@@ -75,6 +75,8 @@ pub struct Settings {
     pub modern_orthography: bool,
     pub quick_telex: bool,
     pub restore_if_wrong_spelling: bool,
+    /// like `restore_if_wrong_spelling`, but only when the keys spell an English word
+    pub restore_english: bool,
     pub use_macro: bool,
     pub use_macro_in_english: bool,
     pub auto_caps_macro: bool,
@@ -95,6 +97,7 @@ impl Default for Settings {
             modern_orthography: true,
             quick_telex: false,
             restore_if_wrong_spelling: false,
+            restore_english: false,
             use_macro: true,
             use_macro_in_english: true,
             auto_caps_macro: false,
@@ -129,6 +132,14 @@ const PROCESSING_CHAR: [[u16; 11]; 4] = [
 
 fn is_word_break(event: KeyEvent, data: u16) -> bool {
     event == KeyEvent::Mouse || BREAK_CODE.contains(&data)
+}
+
+/// English words that Telex typing changes, sorted: the most frequent 50 000 English words
+/// of FrequencyWords (github.com/hermitdave/FrequencyWords, content CC BY-SA 4.0), kept
+/// when typing them with Telex does not give them back unchanged.
+fn english_words() -> &'static [&'static str] {
+    static WORDS: std::sync::OnceLock<Vec<&'static str>> = std::sync::OnceLock::new();
+    WORDS.get_or_init(|| include_str!("english.txt").lines().collect())
 }
 
 /// Convert engine character data to the output character code of `code_table`.
@@ -229,6 +240,9 @@ pub struct Engine {
     long_word_helper: Vec<u32>,
     typing_states: Vec<Vec<u32>>,
     key_states: [u32; MAX_BUFF],
+    /// every key of the current word, also the repeated mark key that `key_states` drops
+    /// ("boss": b o s s, while key_states keeps b o s like the C++ engine)
+    raw_keys: Vec<u32>,
     state_index: i32,
 
     temp_disable_key: bool,
@@ -272,6 +286,7 @@ impl Engine {
             long_word_helper: Vec::new(),
             typing_states: Vec::new(),
             key_states: [0; MAX_BUFF],
+            raw_keys: Vec::new(),
             state_index: 0,
             temp_disable_key: false,
             is_correct: false,
@@ -409,6 +424,7 @@ impl Engine {
         self.hook.new_char_count = 0;
         self.temp_disable_key = false;
         self.state_index = 0;
+        self.raw_keys.clear();
         self.has_handled_macro = false;
         self.has_handle_quick_consonant = false;
         self.long_word_helper.clear();
@@ -643,6 +659,9 @@ impl Engine {
 
     fn insert_state(&mut self, key_code: u16, is_caps: bool) {
         let v = key_code as u32 | if is_caps { CAPS_MASK } else { 0 };
+        if self.raw_keys.len() < MAX_BUFF {
+            self.raw_keys.push(v);
+        }
         if self.state_index >= MAXB {
             self.key_states.copy_within(1.., 0);
             self.key_states[MAX_BUFF - 1] = v;
@@ -1373,8 +1392,11 @@ impl Engine {
     }
 
     fn check_restore_if_wrong_spelling(&mut self, handle_code: Code) -> bool {
+        // Changed by a mark, or keys were consumed: "boss" shows "bos" (the second s removed
+        // the first one's mark), which has no mark left (the C++ version missed that).
+        let consumed = self.index != self.state_index;
         for ii in 0..self.index {
-            if !is_consonant(self.chr(ii)) && self.tw(ii) & (MARK_MASK | TONE_MASK | TONEW_MASK) != 0 {
+            if consumed || (!is_consonant(self.chr(ii)) && self.tw(ii) & (MARK_MASK | TONE_MASK | TONEW_MASK) != 0) {
                 self.hook.code = handle_code;
                 self.hook.backspace_count = self.index;
                 self.hook.new_char_count = self.state_index;
@@ -1387,6 +1409,65 @@ impl Engine {
             }
         }
         false
+    }
+
+    /// The current word is not Vietnamese: give back the keys as typed, if an option asks
+    /// for it. An English word gets all its keys back ("boss", not "bos").
+    fn restore_word(&mut self, code: Code) -> bool {
+        if self.s.restore_english && self.typed_english_word() {
+            let n = self.raw_keys.len().min(MAX_BUFF);
+            self.key_states[..n].copy_from_slice(&self.raw_keys[..n]);
+            self.state_index = n as i32;
+        } else if !self.s.restore_if_wrong_spelling {
+            return false;
+        }
+        self.check_restore_if_wrong_spelling(code)
+    }
+
+    /// The keys of the current word spell an English word that Telex would change
+    /// ("boss" -> "bos", "good" -> "gôd").
+    fn typed_english_word(&self) -> bool {
+        let mut word = String::new();
+        for &k in &self.raw_keys {
+            match key_to_char(k & !CAPS_MASK) as u8 {
+                c @ b'a'..=b'z' => word.push(c as char),
+                _ => return false,
+            }
+        }
+        word.len() >= 3 && english_words().binary_search(&word.as_str()).is_ok()
+    }
+
+    /// The current word failed the spelling check (used to build the English word list).
+    #[doc(hidden)]
+    pub fn spelling_failed(&self) -> bool {
+        self.temp_disable_key
+    }
+
+    /// Esc right after a word was changed: put back the keys exactly as typed, and keep the
+    /// rest of the word as typed. False (nothing to undo) if the word shows as typed.
+    pub fn undo_word(&mut self) -> bool {
+        let n = self.raw_keys.len().min(MAX_BUFF) as i32;
+        if self.index == 0 || n == 0 {
+            return false;
+        }
+        let raw = self.raw_keys.clone();
+        self.key_states[..raw.len()].copy_from_slice(&raw);
+        self.state_index = n;
+        let changed = self.index != n || (0..self.index).any(|i| self.tw(i) & (MARK_MASK | TONE_MASK | TONEW_MASK) != 0);
+        if !changed {
+            return false;
+        }
+        self.hook.code = Code::WillProcess;
+        self.hook.ext_code = 0;
+        self.hook.backspace_count = self.index;
+        self.hook.new_char_count = n;
+        for i in 0..n {
+            self.typing_word[i as usize] = self.key_states[i as usize];
+            self.set_hd(n - 1 - i, self.key_states[i as usize]);
+        }
+        self.index = n;
+        self.temp_disable_key = true;
+        true
     }
 
     fn check_quick_consonant(&mut self) -> bool {
@@ -1510,11 +1591,11 @@ impl Engine {
                 && macro_break
             {
                 self.check_quick_consonant();
-            } else if self.s.restore_if_wrong_spelling && is_word_break(event, data) {
+            } else if (self.s.restore_if_wrong_spelling || self.s.restore_english) && is_word_break(event, data) {
                 if !self.temp_disable_key && self.spelling_on {
                     self.check_spelling(true);
                 }
-                if self.temp_disable_key && !self.check_restore_if_wrong_spelling(Code::RestoreAndStartNewSession) {
+                if self.temp_disable_key && !self.restore_word(Code::RestoreAndStartNewSession) {
                     self.hook.code = Code::DoNothing;
                 }
             }
@@ -1571,8 +1652,11 @@ impl Engine {
                 && self.check_quick_consonant()
             {
                 self.space_count += 1;
-            } else if self.s.restore_if_wrong_spelling && self.temp_disable_key && !self.has_handled_macro {
-                if !self.check_restore_if_wrong_spelling(Code::Restore) {
+            } else if self.temp_disable_key
+                && !self.has_handled_macro
+                && (self.s.restore_if_wrong_spelling || self.s.restore_english)
+            {
+                if !self.restore_word(Code::Restore) {
                     self.hook.code = Code::DoNothing;
                 }
                 self.space_count += 1;
@@ -1612,6 +1696,7 @@ impl Engine {
                 if self.state_index > 0 {
                     self.state_index -= 1;
                 }
+                self.raw_keys.pop();
                 if self.index > 0 {
                     self.index -= 1;
                     if let Some(prev) = self.long_word_helper.pop() {
@@ -1709,6 +1794,7 @@ impl Engine {
                 self.index = 0;
                 self.temp_disable_key = false;
                 self.state_index = 0;
+                self.raw_keys.clear();
                 self.hook.ext_code = 3;
                 self.special_char.push(data as u32 | caps_bit);
             }

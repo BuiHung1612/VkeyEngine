@@ -5,9 +5,12 @@ Bộ gõ tiếng Việt cho macOS và Windows, viết bằng Rust. Một engine 
 - Kiểu gõ: Telex, VNI, Simple Telex 1 / 2
 - Bảng mã: Unicode dựng sẵn, TCVN3 (ABC), VNI Windows, Unicode tổ hợp, Vietnamese Locale CP 1258
 - Kiểm tra chính tả, tự khôi phục từ sai, đặt dấu kiểu mới, gõ nhanh phụ âm
+- Giữ nguyên từ tiếng Anh khi gõ Telex (boss, good, search…), bấm Esc để trả lại đúng các phím vừa gõ
+- Hiện V / E cạnh con trỏ khi chuyển chế độ
+- Không gõ tiếng Việt trong các ứng dụng chọn trước (Terminal, IDE, game…)
 - Gõ tắt (nhập / xuất định dạng UniKey), tự viết hoa theo từ gõ tắt
 - Tự nhớ chế độ gõ và bảng mã theo từng ứng dụng
-- Công cụ chuyển mã clipboard (văn bản và HTML), có phím tắt
+- Công cụ chuyển mã clipboard (văn bản và HTML); phím tắt chuyển mã ngay văn bản đang chọn
 - Tự kiểm tra và cài bản mới từ GitHub Releases (có thể tắt)
 - Trang "Hoạt động": RAM, CPU, thời gian xử lý mỗi phím
 
@@ -45,4 +48,6 @@ Người dùng chuyển từ OpenKey: cấu hình và gõ tắt được chép s
 
 ## Giấy phép
 
-GPL v3 (xem `LICENSE`). VKeyEngine là bản phát triển tiếp từ [OpenKey](https://github.com/tuyenvm/OpenKey) © 2019 Mai Vũ Tuyên, cũng theo GPL v3.
+GPL v3 (xem `LICENSE`).
+
+`src/english.txt` (các từ tiếng Anh thông dụng mà Telex làm biến dạng) được lọc từ danh sách 50 000 từ của [FrequencyWords](https://github.com/hermitdave/FrequencyWords) © Hermit Dave, giấy phép [CC BY-SA 4.0](https://creativecommons.org/licenses/by-sa/4.0/). VKeyEngine là bản phát triển tiếp từ [OpenKey](https://github.com/tuyenvm/OpenKey) © 2019 Mai Vũ Tuyên, cũng theo GPL v3.

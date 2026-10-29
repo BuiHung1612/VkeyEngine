@@ -245,6 +245,53 @@ pub fn app_name(bundle_id: &str) -> String {
         .map_or_else(|| bundle_id.to_string(), |s| s.to_string())
 }
 
+/// Text caret of the focused element, in screen coordinates with the origin at the top
+/// left of the main screen (Accessibility). None if the app does not tell.
+pub fn caret_rect() -> Option<(f64, f64, f64, f64)> {
+    #[repr(C)]
+    #[derive(Default)]
+    struct Rect {
+        x: f64,
+        y: f64,
+        w: f64,
+        h: f64,
+    }
+    extern "C" {
+        fn AXUIElementCreateSystemWide() -> *const c_void;
+        fn AXUIElementSetMessagingTimeout(element: *const c_void, seconds: f32) -> i32;
+        fn AXUIElementCopyAttributeValue(element: *const c_void, attribute: *const c_void, value: *mut *const c_void) -> i32;
+        fn AXUIElementCopyParameterizedAttributeValue(
+            element: *const c_void,
+            attribute: *const c_void,
+            parameter: *const c_void,
+            value: *mut *const c_void,
+        ) -> i32;
+        fn AXValueGetValue(value: *const c_void, kind: u32, out: *mut c_void) -> bool;
+    }
+    const CG_RECT: u32 = 3; // kAXValueCGRectType
+    let attr = |s: &str| NSString::from_str(s);
+    unsafe {
+        let system = AXUIElementCreateSystemWide();
+        if system.is_null() {
+            return None;
+        }
+        AXUIElementSetMessagingTimeout(system, 0.1); // a hung app must not hang us
+        let (mut focused, mut range, mut bounds) = (std::ptr::null(), std::ptr::null(), std::ptr::null());
+        let mut rect = Rect::default();
+        let ok = AXUIElementCopyAttributeValue(system, Retained::as_ptr(&attr("AXFocusedUIElement")) as _, &mut focused) == 0
+            && AXUIElementCopyAttributeValue(focused, Retained::as_ptr(&attr("AXSelectedTextRange")) as _, &mut range) == 0
+            && AXUIElementCopyParameterizedAttributeValue(focused, Retained::as_ptr(&attr("AXBoundsForRange")) as _, range, &mut bounds) == 0
+            && AXValueGetValue(bounds, CG_RECT, &mut rect as *mut Rect as *mut c_void);
+        for p in [bounds, range, focused, system] {
+            if !p.is_null() {
+                CFRelease(p);
+            }
+        }
+        // some apps answer with an empty rectangle at the origin
+        (ok && (rect.x != 0.0 || rect.y != 0.0) && rect.h > 0.0).then_some((rect.x, rect.y, rect.w, rect.h))
+    }
+}
+
 /// Local date as yyyymmdd.
 pub fn today() -> u32 {
     #[repr(C)]

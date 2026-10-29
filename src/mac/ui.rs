@@ -85,6 +85,8 @@ static TOGGLES: &[Toggle] = &[
     t("vTempOffSpelling", false, "Tạm tắt kiểm tra chính tả bằng phím ⌃", P_SPELL),
     t("vAllowConsonantZFWJ", false, "Cho phép phụ âm đầu Z, F, W, J", P_SPELL),
     t("ModernOrthography", false, "Đặt dấu kiểu mới (oà, uý thay vì òa, úy)", P_GENERAL),
+    t("RestoreEnglishWord", true, "Giữ nguyên từ tiếng Anh (boss, good, search…)", P_GENERAL),
+    t("EscUndo", true, "Bấm Esc để trả lại đúng các phím vừa gõ", P_SPELL),
     t("QuickTelex", false, "Gõ nhanh: cc→ch gg→gi kk→kh nn→ng qq→qu pp→ph tt→th", P_QUICK),
     t("vQuickStartConsonant", false, "Gõ tắt phụ âm đầu: f→ph j→gi w→qu", P_QUICK),
     t("vQuickEndConsonant", false, "Gõ tắt phụ âm cuối: g→ng h→nh k→ch", P_QUICK),
@@ -96,6 +98,7 @@ static TOGGLES: &[Toggle] = &[
     t("ShowUIOnStartup", false, "Hiện bảng điều khiển khi khởi động", P_UI),
     t("CheckUpdate", true, "Tự kiểm tra bản mới", P_GENERAL),
     t("vShowIconOnDock", false, "Hiện biểu tượng trên Dock", P_UI),
+    t("ModeHUD", true, "Hiện V / E cạnh con trỏ khi chuyển chế độ", P_UI),
     t("UseSmartSwitchKey", true, "Tự nhớ chế độ gõ Việt / Anh theo từng ứng dụng", P_SMART),
     t("vRememberCode", true, "Tự nhớ bảng mã theo từng ứng dụng", P_SMART),
     t("vOtherLanguage", true, "Tắt tiếng Việt khi dùng bàn phím ngôn ngữ khác", P_SMART),
@@ -219,6 +222,9 @@ struct Ui {
     /// "Hoạt động" page: value labels (see ACTIVITY_ROWS) and the CPU graph
     activity_values: Vec<Retained<NSTextField>>,
     cpu_graph: Option<Retained<GraphView>>,
+    /// V / E badge shown next to the caret when the mode changes, and its fade timer
+    hud: Option<(Retained<NSPanel>, Retained<NSTextField>)>,
+    hud_timer: Option<Retained<NSTimer>>,
     macros: Option<Retained<NSWindow>>,
     convert: Option<Retained<NSWindow>>,
     about: Option<Retained<NSWindow>>,
@@ -817,7 +823,8 @@ pub fn refresh() {
         for (i, b) in &u.toggles {
             let tg = &TOGGLES[*i];
             let _: () = unsafe { msg_send![&**b, setState: on_off(toggle_on(tg))] };
-            let needs_spelling = matches!(tg.key, "RestoreIfInvalidWord" | "vTempOffSpelling" | "vAllowConsonantZFWJ");
+            let needs_spelling =
+                matches!(tg.key, "RestoreIfInvalidWord" | "RestoreEnglishWord" | "vTempOffSpelling" | "vAllowConsonantZFWJ");
             b.setEnabled(!needs_spelling || spelling);
             if tg.key == "vFixChromiumBrowser" {
                 b.setEnabled(o.fix_recommend_browser);
@@ -1027,12 +1034,22 @@ pub fn quick_convert() {
 
 fn quick_convert_with_alert(always_alert: bool) {
     let (_, o) = read_settings();
-    let pb = NSPasteboard::generalPasteboard();
+    if !convert_pasteboard(&NSPasteboard::generalPasteboard()) {
+        alert("Không có dữ liệu trong clipboard!", "Hãy sao chép một đoạn văn bản để chuyển mã.");
+        return;
+    }
+    if o.convert_alert || always_alert {
+        alert("Chuyển mã thành công!", "Kết quả đã được lưu trong clipboard.");
+    }
+}
+
+/// Convert the text and HTML on the pasteboard in place. False if it holds no text.
+fn convert_pasteboard(pb: &NSPasteboard) -> bool {
+    let (_, o) = read_settings();
     let html = unsafe { pb.stringForType(NSPasteboardTypeHTML) }.map(|s| convert(&s.to_string(), &o.convert));
     let text = unsafe { pb.stringForType(NSPasteboardTypeString) }.map(|s| convert(&s.to_string(), &o.convert));
     if html.is_none() && text.is_none() {
-        alert("Không có dữ liệu trong clipboard!", "Hãy sao chép một đoạn văn bản để chuyển mã.");
-        return;
+        return false;
     }
     pb.clearContents();
     if let Some(h) = html {
@@ -1041,9 +1058,74 @@ fn quick_convert_with_alert(always_alert: bool) {
     if let Some(t) = text {
         unsafe { pb.setString_forType(&ns(&t), NSPasteboardTypeString) };
     }
-    if o.convert_alert || always_alert {
-        alert("Chuyển mã thành công!", "Kết quả đã được lưu trong clipboard.");
-    }
+    true
+}
+
+type SavedPasteboard = Vec<Vec<(Retained<NSString>, Retained<NSData>)>>;
+
+/// Everything on the pasteboard (all items, all types), to put it back afterwards.
+fn save_pasteboard(pb: &NSPasteboard) -> SavedPasteboard {
+    let Some(items) = pb.pasteboardItems() else { return Vec::new() };
+    items.iter().map(|item| item.types().iter().filter_map(|t| Some((t.clone(), item.dataForType(&t)?))).collect()).collect()
+}
+
+fn restore_pasteboard(pb: &NSPasteboard, saved: &SavedPasteboard) {
+    pb.clearContents();
+    let items: Vec<Retained<ProtocolObject<dyn NSPasteboardWriting>>> = saved
+        .iter()
+        .map(|types| {
+            let item = NSPasteboardItem::new();
+            for (t, d) in types {
+                item.setData_forType(d, t);
+            }
+            ProtocolObject::from_retained(item)
+        })
+        .collect();
+    pb.writeObjects(&NSArray::from_retained_slice(&items));
+}
+
+/// Convert hot key: convert the selected text in place (copy, convert, paste, then put the
+/// clipboard back). With nothing selected, convert the clipboard as before.
+pub fn convert_selection() {
+    use objc2_core_graphics::{CGEventFlags, CGEventSource, CGEventSourceStateID};
+    let pb = NSPasteboard::generalPasteboard();
+    let saved = save_pasteboard(&pb);
+    let start = pb.changeCount();
+    let (phase, ticks) = (std::cell::Cell::new(0u8), std::cell::Cell::new(0u32));
+    let block = RcBlock::new(move |timer: NonNull<NSTimer>| {
+        let done = || unsafe { timer.as_ref() }.invalidate();
+        let n = ticks.get() + 1;
+        ticks.set(n);
+        let pb = NSPasteboard::generalPasteboard();
+        match phase.get() {
+            // wait until the hot key's modifiers are up: the app would see them with our Cmd+C
+            0 => {
+                let mods = CGEventFlags::MaskCommand.0 | CGEventFlags::MaskControl.0 | CGEventFlags::MaskAlternate.0 | CGEventFlags::MaskShift.0;
+                if CGEventSource::flags_state(CGEventSourceStateID::CombinedSessionState).0 & mods != 0 && n < 30 {
+                    return;
+                }
+                with_app(|a| a.tap.post_command_key(crate::tables::KEY_C));
+                phase.set(1);
+                ticks.set(0);
+            }
+            1 if pb.changeCount() != start => {
+                convert_pasteboard(&pb);
+                with_app(|a| a.tap.post_command_key(crate::tables::KEY_V));
+                phase.set(2);
+                ticks.set(0);
+            }
+            1 if n > 10 => {
+                done(); // nothing selected
+                quick_convert_with_alert(false);
+            }
+            2 if n >= 8 => {
+                restore_pasteboard(&pb, &saved);
+                done();
+            }
+            _ => {}
+        }
+    });
+    unsafe { NSTimer::scheduledTimerWithTimeInterval_repeats_block(0.05, true, &block) };
 }
 
 // ---------------------------------------------------------------- window building
@@ -1909,5 +1991,90 @@ open "$2""#;
         Ok(()) => UpdateEvent::Ready,
         Err(e) => UpdateEvent::Failed(e),
     });
+}
+
+// ---------------------------------------------------------------- mode badge
+
+const HUD_W: f64 = 34.0;
+const HUD_H: f64 = 26.0;
+
+fn hud() -> (Retained<NSPanel>, Retained<NSTextField>) {
+    if let Some(h) = ui(|u| u.hud.clone()) {
+        return h;
+    }
+    let mtm = mtm();
+    let panel = NSPanel::initWithContentRect_styleMask_backing_defer(
+        NSPanel::alloc(mtm),
+        rect(0.0, 0.0, HUD_W, HUD_H),
+        NSWindowStyleMask::Borderless | NSWindowStyleMask::NonactivatingPanel,
+        NSBackingStoreType::Buffered,
+        false,
+    );
+    unsafe { panel.setReleasedWhenClosed(false) };
+    panel.setLevel(NSPopUpMenuWindowLevel);
+    panel.setOpaque(false);
+    panel.setBackgroundColor(Some(&NSColor::clearColor()));
+    panel.setIgnoresMouseEvents(true);
+    panel.setHasShadow(true);
+    panel.setCollectionBehavior(
+        NSWindowCollectionBehavior::CanJoinAllSpaces | NSWindowCollectionBehavior::Stationary | NSWindowCollectionBehavior::FullScreenAuxiliary,
+    );
+    let badge = card(0.0, 0.0, HUD_W, HUD_H);
+    badge.setCornerRadius(7.0);
+    badge.setBorderWidth(0.0);
+    badge.setFillColor(&mono(0.0, 1.0)); // black in light mode, white in dark mode
+    let label = text("V", 15.0, true, false);
+    label.setTextColor(Some(&mono(1.0, 0.0)));
+    label.setAlignment(NSTextAlignment::Center);
+    label.setFrame(rect(0.0, (HUD_H - 19.0) / 2.0, HUD_W, 19.0));
+    if let Some(c) = badge.contentView() {
+        c.addSubview(&label);
+    }
+    panel.setContentView(Some(&badge));
+    ui(|u| u.hud = Some((panel.clone(), label.clone())));
+    (panel, label)
+}
+
+/// Briefly show V or E next to the text caret (or the mouse pointer when the app does not
+/// say where its caret is), then fade out.
+pub fn show_mode_hud() {
+    let mtm = mtm();
+    let (panel, label) = hud();
+    label.setStringValue(&ns(if read_settings().0.language == 1 { "V" } else { "E" }));
+    let origin = match sys::caret_rect() {
+        Some((x, y, w, h)) => {
+            // Accessibility: origin at the top left of the main screen; AppKit: bottom left
+            let main_h = NSScreen::screens(mtm).firstObject().map_or(0.0, |s| s.frame().size.height);
+            NSPoint::new(x + w + 6.0, main_h - y - h / 2.0 - HUD_H / 2.0)
+        }
+        None => {
+            let m = NSEvent::mouseLocation();
+            NSPoint::new(m.x + 14.0, m.y - HUD_H - 10.0)
+        }
+    };
+    panel.setFrameOrigin(origin);
+    panel.setAlphaValue(1.0);
+    panel.orderFrontRegardless();
+    if let Some(t) = ui(|u| u.hud_timer.take()) {
+        t.invalidate();
+    }
+    let ticks = std::cell::Cell::new(0u32);
+    let block = RcBlock::new(move |timer: NonNull<NSTimer>| {
+        let n = ticks.get() + 1;
+        ticks.set(n);
+        if n <= 12 {
+            return; // 0.6 s fully visible
+        }
+        let (panel, _) = hud();
+        let alpha = panel.alphaValue() - 0.2;
+        if alpha <= 0.0 {
+            panel.orderOut(None);
+            unsafe { timer.as_ref() }.invalidate();
+        } else {
+            panel.setAlphaValue(alpha);
+        }
+    });
+    let timer = unsafe { NSTimer::scheduledTimerWithTimeInterval_repeats_block(0.05, true, &block) };
+    ui(|u| u.hud_timer = Some(timer));
 }
 
