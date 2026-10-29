@@ -1,6 +1,6 @@
 [package]
 name = "vkeyengine"
-version = "1.0.7"
+version = "1.0.8"
 edition = "2021"
 description = "VKeyEngine - Vietnamese input method for macOS and Windows"
 license = "GPL-3.0"

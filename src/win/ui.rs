@@ -943,8 +943,13 @@ unsafe extern "system" fn main_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam
         }
         WM_TIMER if wparam == TIMER_HOOK => {
             hook::check_alive();
-            let (cpu, memory) = super::process_usage();
-            crate::stats::sample(cpu, memory);
+            let activity = all_windows()
+                .into_iter()
+                .any(|h| with_win(h, |w| w.kind == Kind::Settings && w.page == ACTIVITY_PAGE) == Some(true));
+            if activity {
+                let (cpu, memory) = super::process_usage();
+                crate::stats::sample(cpu, memory); // only for the Activity page
+            }
             crate::stats::set_day(super::today());
             thread_local! {
                 static TICKS: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
@@ -1595,6 +1600,10 @@ fn show(kind: Kind) {
 }
 
 fn show_page(hwnd: HWND, page: usize) {
+    if page == ACTIVITY_PAGE {
+        let (cpu, memory) = super::process_usage();
+        crate::stats::sample(cpu, memory); // memory at once; CPU from the next sample
+    }
     load_page(hwnd, page);
     refresh();
 }

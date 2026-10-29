@@ -31,6 +31,8 @@ pub fn record_key(spent: Duration) {
 }
 
 /// Add a sample: total CPU time used by the process so far, and its memory in bytes.
+/// Samples are taken only while the Activity page is open; after a pause the first one
+/// only restarts the count (a percentage over the whole pause would mean nothing).
 pub fn sample(cpu_time: Duration, memory: u64) {
     sample_at(Instant::now(), cpu_time, memory);
 }
@@ -40,7 +42,7 @@ fn sample_at(now: Instant, cpu_time: Duration, memory: u64) {
     let s = g.get_or_insert_with(|| Samples { started: now, last: None, cpu: VecDeque::new(), memory });
     if let Some((at, cpu)) = s.last {
         let wall = now.duration_since(at).as_secs_f32();
-        if wall > 0.0 {
+        if wall > 0.0 && wall <= 5.0 {
             let percent = cpu_time.saturating_sub(cpu).as_secs_f32() / wall * 100.0;
             if s.cpu.len() == HISTORY {
                 s.cpu.pop_front();
@@ -292,5 +294,9 @@ mod tests {
         let s = snapshot();
         assert_eq!(s.memory, 20);
         assert!((s.cpu - 25.0).abs() < 0.01, "{}", s.cpu);
+        // after a pause (page closed) the next sample does not make a point of the graph
+        let points = s.cpu_history.len();
+        sample_at(t + Duration::from_secs(60), Duration::from_millis(900), 30);
+        assert_eq!(snapshot().cpu_history.len(), points);
     }
 }

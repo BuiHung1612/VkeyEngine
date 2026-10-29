@@ -582,8 +582,10 @@ fn watchdog() {
     if ui(|u| std::mem::replace(&mut u.health, health.clone()) != health) {
         refresh();
     }
-    let (cpu, memory) = sys::process_usage();
-    crate::stats::sample(cpu, memory);
+    if activity_visible() {
+        let (cpu, memory) = sys::process_usage();
+        crate::stats::sample(cpu, memory); // only for the Activity page
+    }
     crate::stats::set_day(sys::today());
     thread_local! {
         static TICKS: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
@@ -1613,6 +1615,10 @@ fn show_page(i: usize) {
         return;
     };
     resize_content(&win, win.contentView().map_or(0.0, |v| v.frame().size.width), top + h);
+    if i == ACTIVITY_PAGE {
+        let (cpu, memory) = sys::process_usage();
+        crate::stats::sample(cpu, memory); // memory at once; CPU from the next sample
+    }
     update_activity();
 }
 
@@ -1639,6 +1645,10 @@ fn activity_value() -> Retained<NSView> {
     l.setFrameSize(NSSize::new(230.0, 17.0));
     ui(|u| u.activity_values.push(l.clone()));
     Retained::into_super(Retained::into_super(l))
+}
+
+fn activity_visible() -> bool {
+    ui(|u| u.page == ACTIVITY_PAGE && u.settings.as_ref().is_some_and(|w| w.isVisible()))
 }
 
 /// Fill the "Hoạt động" page, if it is on screen.
