@@ -386,6 +386,14 @@ define_class!(
     }
 
     unsafe impl NSTextFieldDelegate for Delegate {}
+
+    unsafe impl NSWindowDelegate for Delegate {
+        #[unsafe(method(windowWillClose:))]
+        fn window_will_close(&self, _n: &NSNotification) {
+            // after AppKit is done closing it, not in the middle
+            defer(release_closed_windows);
+        }
+    }
 );
 
 define_class!(
@@ -980,6 +988,52 @@ fn record_hotkey(tag: isize, sender: &AnyObject) {
     ui(|u| u.key_monitor = monitor);
 }
 
+/// Let closed windows go, with their controls: the settings window alone holds ~18 MB of
+/// AppKit (switches are SwiftUI underneath on macOS 26). Rebuilding one takes a few ms.
+fn release_closed_windows() {
+    let gone: Vec<Retained<NSWindow>> = ui(|u| {
+        let closed = |w: &Option<Retained<NSWindow>>| w.as_ref().is_some_and(|w| !w.isVisible() && !w.isMiniaturized());
+        let mut gone = Vec::new();
+        if closed(&u.settings) {
+            gone.extend(u.settings.take());
+            u.pages.clear();
+            u.activity_values.clear();
+            u.cpu_graph = None;
+            u.exclude_value = None;
+        }
+        if closed(&u.macros) {
+            gone.extend(u.macros.take());
+            (u.macro_table, u.macro_name, u.macro_content, u.macro_add) = (None, None, None, None);
+        }
+        for w in [&mut u.convert, &mut u.about] {
+            if closed(w) {
+                gone.extend(w.take());
+            }
+        }
+        let in_gone = |v: &NSView| v.window().is_some_and(|w| gone.iter().any(|g| std::ptr::eq(&*w, &**g)));
+        u.toggles.retain(|(_, c)| !in_gone(c));
+        u.popups.retain(|(_, p)| !in_gone(p));
+        u.record_switch.retain(|b| !in_gone(b));
+        u.record_convert.retain(|b| !in_gone(b));
+        gone
+    });
+    if gone.is_empty() {
+        return;
+    }
+    stop_recording();
+    drop(gone); // outside the UI borrow: deallocation may call back into AppKit
+    defer(return_free_memory);
+}
+
+/// Give the pages malloc kept from the freed window back to the system (otherwise they still
+/// count as the app's memory until the system runs short).
+fn return_free_memory() {
+    extern "C" {
+        fn malloc_zone_pressure_relief(zone: *mut std::ffi::c_void, goal: usize) -> usize;
+    }
+    unsafe { malloc_zone_pressure_relief(std::ptr::null_mut(), 0) };
+}
+
 fn stop_recording() {
     if let Some(m) = ui(|u| u.key_monitor.take()) {
         unsafe { NSEvent::removeMonitor(&m) };
@@ -1384,6 +1438,7 @@ fn new_window(title: &str, page: &mut Page) -> Retained<NSWindow> {
     win.setMovableByWindowBackground(true);
     win.setBackgroundColor(Some(&mono(1.0, 0.0)));
     win.setContentView(Some(&page.view));
+    win.setDelegate(Some(ProtocolObject::from_ref(&*delegate())));
     win.center();
     win
 }
