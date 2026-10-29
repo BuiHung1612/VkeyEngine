@@ -73,6 +73,72 @@ fn modify_case(code: &mut u32, upper: bool, code_table: u8) -> bool {
     false
 }
 
+/// Ready-made macros added with one button (only the names not taken yet).
+pub struct Pack {
+    pub name: &'static str,
+    pub note: &'static str,
+    pub items: &'static [(&'static str, &'static str)],
+}
+
+pub static PACKS: &[Pack] = &[
+    Pack {
+        name: "Emoji",
+        note: ":) → 😊, <3 → ❤️, (y) → 👍",
+        items: &[
+            (":)", "😊"),
+            (":D", "😄"),
+            (":(", "😢"),
+            (":'(", "😭"),
+            (";)", "😉"),
+            (":P", "😛"),
+            (":O", "😮"),
+            (":*", "😘"),
+            ("<3", "❤️"),
+            ("(y)", "👍"),
+            ("(n)", "👎"),
+            ("(ok)", "👌"),
+            ("(pray)", "🙏"),
+            ("(fire)", "🔥"),
+        ],
+    },
+    Pack {
+        name: "Ký hiệu",
+        note: "-> → →, (c) → ©, ... → … (lưu ý: gõ code cũng bị đổi, ví dụ \"->\")",
+        items: &[
+            ("->", "→"),
+            ("<-", "←"),
+            ("=>", "⇒"),
+            ("(c)", "©"),
+            ("(r)", "®"),
+            ("(tm)", "™"),
+            ("+-", "±"),
+            ("...", "…"),
+            ("1/2", "½"),
+            ("deg", "°"),
+        ],
+    },
+    Pack {
+        name: "Viết tắt",
+        note: "ko → không, dc → được, ntn → như thế nào",
+        items: &[
+            ("ko", "không"),
+            ("dc", "được"),
+            ("ntn", "như thế nào"),
+            ("bt", "bình thường"),
+            ("mn", "mọi người"),
+            ("ae", "anh em"),
+            ("cty", "công ty"),
+            ("nv", "nhân viên"),
+            ("kh", "khách hàng"),
+            ("sdt", "số điện thoại"),
+            ("tp", "thành phố"),
+            ("hn", "Hà Nội"),
+            ("hcm", "Hồ Chí Minh"),
+            ("vn", "Việt Nam"),
+        ],
+    },
+];
+
 impl Macros {
     /// Binary format (NSUserDefaults "macroData"): u16 count, then for each macro:
     /// u8 text length, text bytes, u16 content length, content bytes (all little endian, UTF-8).
@@ -153,6 +219,18 @@ impl Macros {
     /// Name (text) of the macro whose key is `key`, as `find` left it.
     pub fn text_of(&self, key: &[u32]) -> Option<&str> {
         self.map.get(key).map(|m| m.text.as_str())
+    }
+
+    /// Add the macros of a pack whose names are free; returns how many were added.
+    pub fn add_pack(&mut self, pack: &Pack, code_table: u8) -> usize {
+        let mut added = 0;
+        for (name, content) in pack.items {
+            if !self.has(name, code_table) {
+                self.add(name, content, code_table);
+                added += 1;
+            }
+        }
+        added
     }
 
     pub fn has(&self, name: &str, code_table: u8) -> bool {

@@ -18,6 +18,7 @@ extern "C" {
     fn IsSecureEventInputEnabled() -> bool;
     fn TISGetInputSourceProperty(source: *const c_void, key: *const c_void) -> *const c_void;
     static kTISPropertyInputSourceLanguages: *const c_void;
+    static kTISPropertyInputSourceID: *const c_void;
     fn CFRelease(cf: *const c_void);
 }
 
@@ -53,6 +54,43 @@ pub fn input_source_is_english() -> bool {
         CFRelease(src);
         english
     }
+}
+
+/// Other Vietnamese input methods running next to us: two of them rewrite the same keys
+/// (doubled letters, lost marks). Running apps by name / bundle id, and macOS' own
+/// Vietnamese input source when it is the selected one.
+pub fn other_input_methods() -> Vec<String> {
+    use objc2_app_kit::NSWorkspace;
+    const KNOWN: [&str; 7] = ["unikey", "evkey", "openkey", "gotiengviet", "labankey", "vietkey", "xkey"];
+    let mut found: Vec<String> = Vec::new();
+    for app in NSWorkspace::sharedWorkspace().runningApplications().iter() {
+        let id = app.bundleIdentifier().map(|s| s.to_string()).unwrap_or_default();
+        if id == super::BUNDLE_ID {
+            continue;
+        }
+        let name = app.localizedName().map(|s| s.to_string()).unwrap_or_default();
+        let key = format!("{id} {name}").to_lowercase().replace([' ', '-'], "");
+        if KNOWN.iter().any(|k| key.contains(k)) && !found.contains(&name) {
+            found.push(name);
+        }
+    }
+    unsafe {
+        let src = TISCopyCurrentKeyboardInputSource();
+        if !src.is_null() {
+            let id = TISGetInputSourceProperty(src, kTISPropertyInputSourceID) as *const NSString;
+            if id.as_ref().is_some_and(|i| i.to_string().contains("Vietnamese")) {
+                found.push("Bộ gõ tiếng Việt của macOS".into());
+            }
+            CFRelease(src);
+        }
+    }
+    found
+}
+
+/// Open System Settings at Privacy & Security > Accessibility.
+pub fn open_accessibility_settings() {
+    let url = "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility";
+    let _ = std::process::Command::new("/usr/bin/open").arg(url).status();
 }
 
 /// Label of the launch agent in Contents/Library/LaunchAgents (see build-macos.sh).

@@ -49,6 +49,8 @@ const T_QUIT: isize = 35;
 const T_CHECK_UPDATE: isize = 37;
 const T_EXCLUDE: isize = 38;
 const T_EXCLUDE_CLEAR: isize = 39;
+const T_DIAGNOSE: isize = 45;
+const T_PACK: isize = 46; // + index in macros::PACKS
 const T_PAGE: isize = 40; // + page
 const T_TOGGLE: isize = 100; // + index in TOGGLES
 const T_POPUP: isize = 200; // + index in POPUPS
@@ -112,7 +114,6 @@ const fn hk(key: &'static str, bit: i64, default: i64, title: &'static str, page
 static TOGGLES: &[Toggle] = &[
     t("vCheckSpelling", true, "Kiểm tra chính tả", P_GENERAL),
     t("vRestoreIfWrongSpelling", true, "Tự khôi phục phím gõ nếu từ sai chính tả", P_SPELL),
-    t("vTempOffSpelling", false, "Tạm tắt kiểm tra chính tả bằng phím Ctrl", P_SPELL),
     t("vAllowConsonantZFWJ", false, "Cho phép phụ âm đầu Z, F, W, J", P_SPELL),
     t("vUseModernOrthography", false, "Đặt dấu kiểu mới (oà, uý thay vì òa, úy)", P_GENERAL),
     t("vRestoreEnglishWord", true, "Giữ nguyên từ tiếng Anh (boss, good, search…)", P_GENERAL),
@@ -130,7 +131,6 @@ static TOGGLES: &[Toggle] = &[
     t("vAutoCheckUpdate", true, "Tự kiểm tra bản mới", P_GENERAL),
     t("vUseSmartSwitchKey", true, "Tự nhớ chế độ gõ Việt / Anh theo từng ứng dụng", P_SMART),
     t("vRememberCode", true, "Tự nhớ bảng mã theo từng ứng dụng", P_SMART),
-    t("vTempOffOpenKey", false, "Tạm tắt VKeyEngine bằng phím Alt", P_SMART),
     t("vFixRecommendBrowser", true, "Sửa lỗi gợi ý từ (thanh địa chỉ trình duyệt, Excel...)", P_COMPAT),
     t("vFixChromiumBrowser", false, "Sửa lỗi gợi ý cho Chrome / Edge / Brave (thử nghiệm)", P_COMPAT),
     t("vSendKeyStepByStep", true, "Gửi từng phím một (cho ứng dụng cũ)", P_COMPAT),
@@ -165,7 +165,7 @@ fn toggle_on(t: &Toggle) -> bool {
 
 fn toggle_enabled(t: &Toggle) -> bool {
     match t.key {
-        "vRestoreIfWrongSpelling" | "vRestoreEnglishWord" | "vTempOffSpelling" | "vAllowConsonantZFWJ" => {
+        "vRestoreIfWrongSpelling" | "vRestoreEnglishWord" | "vAllowConsonantZFWJ" => {
             reg::flag("vCheckSpelling", true)
         }
         "vFixChromiumBrowser" => reg::flag("vFixRecommendBrowser", true),
@@ -825,8 +825,11 @@ fn tray(message: NOTIFY_ICON_MESSAGE) {
             ..std::mem::zeroed()
         };
         let mode = if vietnamese { "Tiếng Việt" } else { "Tiếng Anh" };
+        let others = OTHER_IME.lock().unwrap_or_else(|e| e.into_inner()).join(", ");
         let tip = if hook::FRONT_ELEVATED.load(Ordering::SeqCst) {
             "VKeyEngine · ⚠ Ứng dụng này chạy quyền Admin: chạy VKeyEngine bằng quyền Admin để gõ được".to_string()
+        } else if !others.is_empty() {
+            format!("VKeyEngine · ⚠ {others} cũng đang chạy: nên tắt")
         } else if excluded {
             format!("VKeyEngine · Đang tắt trong {front}")
         } else {
@@ -885,6 +888,7 @@ fn tray_menu() {
         AppendMenuW(menu, MF_SEPARATOR, 0, null());
         add(menu, T_SETTINGS, "Bảng điều khiển…", 0);
         add(menu, T_MACROS, "Gõ tắt…", 0);
+        add(menu, T_DIAGNOSE, "Tôi gõ không được…", 0);
         add(menu, T_CHECK_UPDATE, "Kiểm tra bản mới…", 0);
         add(menu, T_ABOUT, "Giới thiệu", 0);
         AppendMenuW(menu, MF_SEPARATOR, 0, null());
@@ -951,6 +955,15 @@ unsafe extern "system" fn main_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam
                 crate::stats::sample(cpu, memory); // only for the Activity page
             }
             crate::stats::set_day(super::today());
+            thread_local! {
+                static IME_TICKS: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+            }
+            if IME_TICKS.with(|t| t.replace(t.get() + 1)).is_multiple_of(5) {
+                let found = super::other_input_methods(); // every 10 s
+                if std::mem::replace(&mut *OTHER_IME.lock().unwrap_or_else(|e| e.into_inner()), found.clone()) != found {
+                    refresh();
+                }
+            }
             thread_local! {
                 static TICKS: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
             }
@@ -1057,6 +1070,8 @@ fn action(hwnd: HWND, tag: isize) {
             });
             refresh();
         }
+        T_DIAGNOSE => diagnose(hwnd),
+        _ if (T_PACK..T_PACK + crate::macros::PACKS.len() as isize).contains(&tag) => add_pack(hwnd, (tag - T_PACK) as usize),
         T_CHECK_UPDATE => {
             std::thread::spawn(|| check_update(true));
         }
@@ -1153,6 +1168,62 @@ fn modifier_key(vk: u16) -> bool {
 
 fn alert(hwnd: HWND, msg: &str) {
     unsafe { MessageBoxW(hwnd, wide(msg).as_ptr(), wide("VKeyEngine").as_ptr(), MB_OK | MB_ICONINFORMATION | MB_SETFOREGROUND) };
+}
+
+/// Other Vietnamese input methods found running (see super::other_input_methods).
+static OTHER_IME: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+
+/// Check what usually stops typing, and say how to fix each problem found.
+fn diagnose(hwnd: HWND) {
+    let (s, o) = read_settings();
+    let mut issues: Vec<String> = Vec::new();
+    if !hook::installed() {
+        issues.push("Bộ gõ chưa chạy. VKeyEngine sẽ tự cài lại trong vài giây.".into());
+    }
+    if hook::FRONT_ELEVATED.load(Ordering::SeqCst) {
+        issues.push("Ứng dụng đang dùng chạy bằng quyền Administrator: Windows không cho VKeyEngine gõ vào đó. Chạy VKeyEngine bằng quyền Administrator.".into());
+    }
+    let others = super::other_input_methods();
+    if !others.is_empty() {
+        issues.push(format!("{} cũng đang chạy. Hai bộ gõ cùng xử lý phím sẽ gây đúp chữ, mất dấu: hãy tắt bộ gõ kia.", others.join(", ")));
+    }
+    let (front, excluded) = front_app();
+    if excluded {
+        issues.push(format!("{front} nằm trong danh sách loại trừ. Bỏ chọn \"Không gõ tiếng Việt trong {front}\" ở icon khay hệ thống."));
+    }
+    if s.language != 1 {
+        issues.push(format!("Đang ở chế độ Tiếng Anh. Bấm {} hoặc nhấp vào icon khay hệ thống.", hotkey::describe(o.switch_key)));
+    }
+    if issues.is_empty() {
+        alert(hwnd, "Không thấy vấn đề nào.\n\nNếu một ứng dụng vẫn gõ lỗi, thử bật \"Gửi từng phím một\" trong Nâng cao, hoặc loại trừ ứng dụng đó.");
+    } else {
+        let text = issues.iter().map(|i| format!("• {i}")).collect::<Vec<_>>().join("\n\n");
+        alert(hwnd, &format!("VKeyEngine tìm thấy vấn đề:\n\n{text}"));
+    }
+}
+
+fn add_pack(hwnd: HWND, i: usize) {
+    let pack = &crate::macros::PACKS[i];
+    let msg = format!(
+        "Thêm gói gõ tắt \"{}\"?\n\n{} gõ tắt, ví dụ {}. Gõ tắt bạn đã có được giữ nguyên.",
+        pack.name,
+        pack.items.len(),
+        pack.note
+    );
+    if !confirm(hwnd, &msg) {
+        return;
+    }
+    let added = with_app(|a| {
+        let t = a.engine.s.code_table;
+        let n = a.engine.macros.add_pack(pack, t);
+        a.save_macros();
+        n
+    })
+    .unwrap_or(0);
+    if let Some(m) = find_kind(Kind::Macros) {
+        reload_macro_rows(m);
+    }
+    alert(hwnd, &if added == 0 { "Bạn đã có đủ các gõ tắt của gói này.".to_string() } else { format!("Đã thêm {added} gõ tắt.") });
 }
 
 fn confirm(hwnd: HWND, msg: &str) -> bool {
@@ -1375,13 +1446,19 @@ fn build(kind: Kind, page: usize) -> Page {
                     ]);
                     p.section("Tuỳ chọn");
                     p.toggle_card(P_GENERAL);
-                    p.buttons(&[("Kiểm tra bản mới", T_CHECK_UPDATE)], &[("Thoát VKeyEngine", T_QUIT)], 0);
+                    p.buttons(&[("Kiểm tra bản mới", T_CHECK_UPDATE), ("Tôi gõ không được…", T_DIAGNOSE)], &[("Thoát VKeyEngine", T_QUIT)], 0);
                 }
                 1 => {
                     p.section("Gõ tắt");
                     p.toggle_card(P_MACRO);
                     p.note("Ví dụ: gõ \"vn\" rồi nhấn phím cách để được \"Việt Nam\".");
                     p.buttons(&[], &[("Bảng gõ tắt…", T_MACROS)], 0);
+                    p.section("Gói gõ tắt mẫu");
+                    p.note("Thêm nhanh các gõ tắt hay dùng. Gõ tắt bạn đã có được giữ nguyên.");
+                    let packs: Vec<(String, isize)> =
+                        crate::macros::PACKS.iter().enumerate().map(|(i, pk)| (format!("+ {}", pk.name), T_PACK + i as isize)).collect();
+                    let packs: Vec<(&str, isize)> = packs.iter().map(|(s, t)| (s.as_str(), *t)).collect();
+                    p.buttons(&packs, &[], 0);
                 }
                 ACTIVITY_PAGE => {
                     p.section("Hôm nay");
@@ -1503,8 +1580,11 @@ fn activity_texts() -> [String; 11] {
     let s = stats::snapshot();
     let t = stats::typing_snapshot();
     let (front, excluded) = front_app();
+    let others = OTHER_IME.lock().unwrap_or_else(|e| e.into_inner()).join(", ");
     let status = if hook::FRONT_ELEVATED.load(Ordering::SeqCst) {
         "⚠ Ứng dụng quyền Admin đang mở".to_string()
+    } else if !others.is_empty() {
+        format!("⚠ {others} cũng đang chạy")
     } else if excluded {
         format!("Đang tắt trong {front}")
     } else if read_settings().0.language == 1 {

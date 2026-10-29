@@ -121,6 +121,11 @@ pub fn raw_key_seen() {
     LAST_RAW_KEY.store(unsafe { GetTickCount() }, Ordering::SeqCst);
 }
 
+/// The keyboard hook is installed (it may still have been dropped since: see check_alive).
+pub fn installed() -> bool {
+    KEYBOARD.load(Ordering::SeqCst) != 0
+}
+
 /// Called periodically by the UI thread: if a key was pressed well after the last key our
 /// keyboard hook saw, Windows has removed the hook, so ask the hook thread to install it
 /// again. Raw input is used as the reference because it does not depend on the hooks (the
@@ -392,13 +397,6 @@ fn handle_key(app: &mut App, msg: u32, vk: u16) -> bool {
             if check_hotkey(convert_key, last, vk, has_key(convert_key)) {
                 app.hook.has_just_used_hotkey = true;
                 ui::post_quick_convert();
-            }
-            let just_used = app.hook.has_just_used_hotkey;
-            if app.opt.temp_off_spelling && !just_used && last & CONTROL != 0 {
-                app.engine.temp_off_spell_checking();
-            }
-            if app.opt.temp_off_app && !just_used && last & ALT != 0 {
-                app.engine.temp_off_engine(true);
             }
             let h = &mut app.hook;
             h.last_flag = h.flag;

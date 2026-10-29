@@ -256,3 +256,19 @@ fn undo_word_gives_the_keys_back() {
     type_with(&mut e, "ban");
     assert!(!e.undo_word());
 }
+
+#[test]
+fn macro_packs_add_free_names_only() {
+    use vkeyengine::macros::PACKS;
+    let mut e = Engine::new(Settings::default());
+    e.macros.add("ko", "khong", 0); // the user's own one stays
+    let n = e.macros.add_pack(&PACKS[2], 0);
+    assert_eq!(n, PACKS[2].items.len() - 1);
+    assert_eq!(e.macros.add_pack(&PACKS[2], 0), 0, "adding again changes nothing");
+    assert_eq!(type_with(&mut e, "ko "), "khong ");
+    assert_eq!(type_with(&mut e, "ntn "), "như thế nào ");
+    e.macros.add_pack(&PACKS[0], 0);
+    e.macros.add_pack(&PACKS[1], 0);
+    assert_eq!(type_with(&mut e, ":) "), "😊 ");
+    assert_eq!(type_with(&mut e, "-> "), "→ ");
+}

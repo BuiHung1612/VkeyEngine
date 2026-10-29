@@ -389,12 +389,6 @@ fn handle(app: &mut App, proxy: CGEventTapProxy, ty: CGEventType, ev: &CGEvent) 
                 ui::defer(ui::convert_selection);
                 return Outcome::Swallow;
             }
-            if app.opt.temp_off_spelling && !t.has_just_used_hotkey && has(t.last_flag, CGEventFlags::MaskControl) {
-                app.engine.temp_off_spell_checking();
-            }
-            if app.opt.temp_off_app && !t.has_just_used_hotkey && has(t.last_flag, CGEventFlags::MaskCommand) {
-                app.engine.temp_off_engine(true);
-            }
             let t = &mut app.tap;
             t.last_flag = 0;
             t.has_just_used_hotkey = false;

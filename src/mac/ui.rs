@@ -34,6 +34,8 @@ const T_PAGE: isize = 36;
 const T_CHECK_UPDATE: isize = 37;
 const T_EXCLUDE: isize = 38;
 const T_EXCLUDE_CLEAR: isize = 39;
+const T_DIAGNOSE: isize = 45;
+const T_PACK: isize = 46; // + index in macros::PACKS
 const T_TOGGLE: isize = 100; // + index in TOGGLES
 const T_POPUP: isize = 200; // + index in POPUPS
 const T_RECORD_SWITCH: isize = 300;
@@ -82,7 +84,6 @@ const fn hk(key: &'static str, bit: i64, default: i64, title: &'static str, page
 static TOGGLES: &[Toggle] = &[
     t("Spelling", true, "Kiểm tra chính tả", P_GENERAL),
     t("RestoreIfInvalidWord", false, "Tự khôi phục phím gõ nếu từ sai chính tả", P_SPELL),
-    t("vTempOffSpelling", false, "Tạm tắt kiểm tra chính tả bằng phím ⌃", P_SPELL),
     t("vAllowConsonantZFWJ", false, "Cho phép phụ âm đầu Z, F, W, J", P_SPELL),
     t("ModernOrthography", false, "Đặt dấu kiểu mới (oà, uý thay vì òa, úy)", P_GENERAL),
     t("RestoreEnglishWord", true, "Giữ nguyên từ tiếng Anh (boss, good, search…)", P_GENERAL),
@@ -102,7 +103,6 @@ static TOGGLES: &[Toggle] = &[
     t("UseSmartSwitchKey", true, "Tự nhớ chế độ gõ Việt / Anh theo từng ứng dụng", P_SMART),
     t("vRememberCode", true, "Tự nhớ bảng mã theo từng ứng dụng", P_SMART),
     t("vOtherLanguage", true, "Tắt tiếng Việt khi dùng bàn phím ngôn ngữ khác", P_SMART),
-    t("vTempOffOpenKey", false, "Tạm tắt VKeyEngine bằng phím ⌘", P_SMART),
     t("FixRecommendBrowser", true, "Sửa lỗi gợi ý từ (thanh địa chỉ trình duyệt, Excel...)", P_COMPAT),
     t("vFixChromiumBrowser", false, "Sửa lỗi gợi ý cho Chrome / Edge / Brave (thử nghiệm)", P_COMPAT),
     t("SendKeyStepByStep", false, "Gửi từng phím một (cho ứng dụng cũ)", P_COMPAT),
@@ -194,6 +194,8 @@ struct Health {
     no_permission: bool,
     /// app that turned on Secure Input
     secure_input: Option<String>,
+    /// other Vietnamese input methods running (checked every 10 s)
+    other_ime: Vec<String>,
 }
 
 #[derive(Default)]
@@ -578,7 +580,15 @@ fn watchdog() {
             a.tap.clear_sync();
         }
     });
-    let health = Health { no_permission: !trusted, secure_input: sys::secure_input_owner() };
+    thread_local! {
+        static IME_TICKS: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+    }
+    let other_ime = if IME_TICKS.with(|t| t.replace(t.get() + 1)).is_multiple_of(5) {
+        sys::other_input_methods()
+    } else {
+        ui(|u| u.health.other_ime.clone())
+    };
+    let health = Health { no_permission: !trusted, secure_input: sys::secure_input_owner(), other_ime };
     if ui(|u| std::mem::replace(&mut u.health, health.clone()) != health) {
         refresh();
     }
@@ -719,6 +729,7 @@ fn create_status_item() {
     menu.addItem(&NSMenuItem::separatorItem(mtm));
     menu.addItem(&with_symbol(menu_item("Bảng điều khiển…", T_SETTINGS, ","), "gearshape"));
     menu.addItem(&with_symbol(menu_item("Gõ tắt…", T_MACROS, ""), "text.badge.plus"));
+    menu.addItem(&with_symbol(menu_item("Tôi gõ không được…", T_DIAGNOSE, ""), "stethoscope"));
     menu.addItem(&with_symbol(menu_item("Kiểm tra bản mới…", T_CHECK_UPDATE, ""), "arrow.down.circle"));
     menu.addItem(&with_symbol(menu_item("Giới thiệu", T_ABOUT, ""), "info.circle"));
     menu.addItem(&NSMenuItem::separatorItem(mtm));
@@ -782,6 +793,8 @@ pub fn refresh() {
                 "⚠ Chưa có quyền Trợ năng (Accessibility)".to_string()
             } else if let Some(app) = &u.health.secure_input {
                 format!("⚠ {app} đang chặn bàn phím (Secure Input)")
+            } else if !u.health.other_ime.is_empty() {
+                format!("⚠ {} cũng đang chạy: nên tắt", u.health.other_ime.join(", "))
             } else if excluded {
                 format!("Đang tắt trong {front_name}")
             } else if key.is_empty() {
@@ -821,7 +834,7 @@ pub fn refresh() {
             let tg = &TOGGLES[*i];
             let _: () = unsafe { msg_send![&**b, setState: on_off(toggle_on(tg))] };
             let needs_spelling =
-                matches!(tg.key, "RestoreIfInvalidWord" | "RestoreEnglishWord" | "vTempOffSpelling" | "vAllowConsonantZFWJ");
+                matches!(tg.key, "RestoreIfInvalidWord" | "RestoreEnglishWord" | "vAllowConsonantZFWJ");
             b.setEnabled(!needs_spelling || spelling);
             if tg.key == "vFixChromiumBrowser" {
                 b.setEnabled(o.fix_recommend_browser);
@@ -886,6 +899,8 @@ fn action(tag: isize, sender: &AnyObject) {
             });
             refresh();
         }
+        T_DIAGNOSE => diagnose(),
+        _ if (T_PACK..T_PACK + crate::macros::PACKS.len() as isize).contains(&tag) => add_pack((tag - T_PACK) as usize),
         T_CHECK_UPDATE => {
             std::thread::spawn(|| check_update(true));
         }
@@ -1059,13 +1074,92 @@ fn alert(msg: &str, info: &str) {
 }
 
 fn confirm(msg: &str, info: &str) -> bool {
+    ask(msg, info, "Có", "Không")
+}
+
+/// Alert with two buttons; true for the first one.
+fn ask(msg: &str, info: &str, yes: &str, no: &str) -> bool {
     activate();
     let a = NSAlert::new(mtm());
     a.setMessageText(&ns(msg));
     a.setInformativeText(&ns(info));
-    a.addButtonWithTitle(&ns("Có"));
-    a.addButtonWithTitle(&ns("Không"));
+    a.addButtonWithTitle(&ns(yes));
+    a.addButtonWithTitle(&ns(no));
     a.runModal() == NSAlertFirstButtonReturn
+}
+
+// ---------------------------------------------------------------- "Tôi gõ không được"
+
+/// Check what usually stops typing, and say how to fix each problem found.
+fn diagnose() {
+    let (s, o) = read_settings();
+    let mut issues: Vec<String> = Vec::new();
+    let trusted = sys::is_trusted(false);
+    if !trusted {
+        issues.push("Chưa có quyền Trợ năng (Accessibility), nên VKeyEngine không nhận được phím.".into());
+    } else if !with_app(|a| a.tap.is_running()).unwrap_or(false) {
+        issues.push("Bộ gõ chưa chạy. VKeyEngine sẽ tự bật lại trong vài giây.".into());
+    }
+    if let Some(app) = sys::secure_input_owner() {
+        issues.push(format!(
+            "{app} đang bật Secure Input (ô mật khẩu, hoặc Terminal → Secure Keyboard Entry): macOS không gửi phím cho bộ gõ nào. Đóng ô mật khẩu hoặc tắt chế độ đó."
+        ));
+    }
+    let others = sys::other_input_methods();
+    if !others.is_empty() {
+        issues.push(format!(
+            "{} cũng đang chạy. Hai bộ gõ cùng xử lý phím sẽ gây đúp chữ, mất dấu: hãy tắt bộ gõ kia.",
+            others.join(", ")
+        ));
+    }
+    let (excluded, front, english_keyboard) =
+        with_app(|a| (a.front_excluded(), a.front_name.clone(), a.english_input_source)).unwrap_or((false, String::new(), true));
+    if excluded {
+        issues.push(format!("{front} nằm trong danh sách loại trừ. Bỏ chọn \"Không gõ tiếng Việt trong {front}\" trên menu."));
+    }
+    if s.language != 1 {
+        let key = hotkey::describe(o.switch_key);
+        issues.push(format!("Đang ở chế độ Tiếng Anh. Bấm {key} hoặc bật công tắc ở đầu menu."));
+    }
+    if o.other_language && !english_keyboard {
+        issues.push(
+            "Bàn phím đang chọn không phải tiếng Anh nên VKeyEngine tạm tắt. Chọn bàn phím ABC hoặc U.S., hoặc tắt \"Tắt tiếng Việt khi dùng bàn phím ngôn ngữ khác\" trong Nâng cao."
+                .into(),
+        );
+    }
+    if issues.is_empty() {
+        alert(
+            "Không thấy vấn đề nào",
+            "Quyền, bộ gõ và bàn phím đều ổn. Nếu một ứng dụng vẫn gõ lỗi, thử bật \"Gửi từng phím một\" trong Nâng cao, hoặc loại trừ ứng dụng đó.",
+        );
+        return;
+    }
+    let text = issues.iter().map(|i| format!("• {i}")).collect::<Vec<_>>().join("\n\n");
+    if !trusted {
+        if ask("VKeyEngine tìm thấy vấn đề", &text, "Mở cài đặt Trợ năng", "Đóng") {
+            sys::open_accessibility_settings();
+        }
+    } else {
+        alert("VKeyEngine tìm thấy vấn đề", &text);
+    }
+}
+
+fn add_pack(i: usize) {
+    let pack = &crate::macros::PACKS[i];
+    let info = format!("{} gõ tắt, ví dụ {}. Gõ tắt bạn đã có được giữ nguyên.", pack.items.len(), pack.note);
+    if !confirm(&format!("Thêm gói gõ tắt \"{}\"?", pack.name), &info) {
+        return;
+    }
+    let added = with_app(|a| {
+        let t = a.engine.s.code_table;
+        let n = a.engine.macros.add_pack(pack, t);
+        a.save_macros();
+        n
+    })
+    .unwrap_or(0);
+    reload_macro_rows();
+    let msg = if added == 0 { "Bạn đã có đủ các gõ tắt của gói này.".to_string() } else { format!("Đã thêm {added} gõ tắt.") };
+    alert("Gói gõ tắt", &msg);
 }
 
 // ---------------------------------------------------------------- quick convert
@@ -1513,13 +1607,19 @@ pub fn show_settings() {
             ]);
             p.section("Tuỳ chọn");
             p.toggle_card(P_GENERAL);
-            p.buttons(&[("Kiểm tra bản mới", T_CHECK_UPDATE)], &[("Thoát VKeyEngine", T_QUIT)], 0);
+            p.buttons(&[("Kiểm tra bản mới", T_CHECK_UPDATE), ("Tôi gõ không được…", T_DIAGNOSE)], &[("Thoát VKeyEngine", T_QUIT)], 0);
         },
         &|p| {
             p.section("Gõ tắt");
             p.toggle_card(P_MACRO);
             p.note("Ví dụ: gõ \"vn\" rồi nhấn phím cách để được \"Việt Nam\".");
             p.buttons(&[], &[("Bảng gõ tắt…", T_MACROS)], 0);
+            p.section("Gói gõ tắt mẫu");
+            p.note("Thêm nhanh các gõ tắt hay dùng. Gõ tắt bạn đã có được giữ nguyên.");
+            let packs: Vec<(String, isize)> =
+                crate::macros::PACKS.iter().enumerate().map(|(i, pk)| (format!("+ {}", pk.name), T_PACK + i as isize)).collect();
+            let packs: Vec<(&str, isize)> = packs.iter().map(|(s, t)| (s.as_str(), *t)).collect();
+            p.buttons(&packs, &[], 0);
         },
         &|p| {
             p.section("Chính tả");

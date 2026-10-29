@@ -430,13 +430,6 @@ impl Engine {
         self.long_word_helper.clear();
     }
 
-    /// Toggle spell checking temporarily (hot key).
-    pub fn temp_off_spell_checking(&mut self) {
-        if self.s.check_spelling {
-            self.spelling_on = !self.spelling_on;
-        }
-    }
-
     pub fn set_check_spelling(&mut self, on: bool) {
         self.s.check_spelling = on;
         self.spelling_on = on;

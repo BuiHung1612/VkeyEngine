@@ -59,9 +59,7 @@ pub struct Options {
     pub switch_key: i64,
     pub send_key_step_by_step: bool,
     pub use_smart_switch_key: bool,
-    pub temp_off_spelling: bool,
     pub remember_code: bool,
-    pub temp_off_app: bool,
     pub fix_recommend_browser: bool,
     pub fix_chromium_browser: bool,
     pub convert: ConvertOptions,
@@ -126,9 +124,7 @@ pub fn read_settings() -> (Settings, Options) {
         switch_key,
         send_key_step_by_step: flag("vSendKeyStepByStep", true),
         use_smart_switch_key: flag("vUseSmartSwitchKey", true),
-        temp_off_spelling: flag("vTempOffSpelling", false),
         remember_code: flag("vRememberCode", true),
-        temp_off_app: flag("vTempOffOpenKey", false),
         fix_recommend_browser: flag("vFixRecommendBrowser", true),
         fix_chromium_browser: flag("vFixChromiumBrowser", false),
         convert: ConvertOptions {
@@ -279,6 +275,41 @@ impl App {
             }
         }
     }
+}
+
+/// Other Vietnamese input methods running next to us (two of them rewrite the same keys:
+/// doubled letters, lost marks): processes by name, and Windows' own Vietnamese keyboard
+/// when it is the one in use.
+pub fn other_input_methods() -> Vec<String> {
+    use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
+    use windows_sys::Win32::System::Diagnostics::ToolHelp::*;
+    use windows_sys::Win32::UI::Input::KeyboardAndMouse::GetKeyboardLayout;
+    use windows_sys::Win32::UI::WindowsAndMessaging::{GetForegroundWindow, GetWindowThreadProcessId};
+    const KNOWN: [&str; 6] = ["unikey", "evkey", "openkey", "gotiengviet", "vietkey", "labankey"];
+    let mut found: Vec<String> = Vec::new();
+    unsafe {
+        let snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+        if snap != INVALID_HANDLE_VALUE {
+            let mut e: PROCESSENTRY32W = std::mem::zeroed();
+            e.dwSize = size_of::<PROCESSENTRY32W>() as u32;
+            let mut more = Process32FirstW(snap, &mut e) != 0;
+            while more {
+                let len = e.szExeFile.iter().position(|&c| c == 0).unwrap_or(e.szExeFile.len());
+                let exe = String::from_utf16_lossy(&e.szExeFile[..len]);
+                let name = exe.trim_end_matches(".exe").trim_end_matches(".EXE").to_string();
+                if KNOWN.iter().any(|k| exe.to_lowercase().contains(k)) && !found.contains(&name) {
+                    found.push(name);
+                }
+                more = Process32NextW(snap, &mut e) != 0;
+            }
+            CloseHandle(snap);
+        }
+        let thread = GetWindowThreadProcessId(GetForegroundWindow(), std::ptr::null_mut());
+        if GetKeyboardLayout(thread) as usize & 0xFFFF == 0x042A {
+            found.push("Bàn phím tiếng Việt của Windows".into());
+        }
+    }
+    found
 }
 
 /// Local date as yyyymmdd.
