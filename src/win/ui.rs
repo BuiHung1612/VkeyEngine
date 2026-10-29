@@ -621,10 +621,30 @@ fn card_brush() -> HBRUSH {
 // ---------------------------------------------------------------- startup
 
 const RESTARTED_ARG: &str = "--restarted";
+const REPLACE_ARG: &str = "--replace";
+
+/// `--replace <exe>`: we are a downloaded update started from the temp folder; once the old
+/// copy has quit, write ourselves over it and start it.
+fn replace_and_restart() -> bool {
+    let args: Vec<String> = std::env::args().collect();
+    let Some(target) = args.iter().position(|a| a == REPLACE_ARG).and_then(|i| args.get(i + 1)) else { return false };
+    let Ok(me) = std::env::current_exe() else { return true };
+    for _ in 0..100 {
+        if std::fs::copy(&me, target).is_ok() {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    let _ = std::process::Command::new(target).arg(RESTARTED_ARG).spawn();
+    true
+}
 
 /// One VKeyEngine per user session; a second launch opens the settings of the first. A copy
 /// started after a crash waits for the crashed one to be gone.
 pub fn acquire_single_instance() -> bool {
+    if replace_and_restart() {
+        return false;
+    }
     let tries = if std::env::args().any(|a| a == RESTARTED_ARG) { 50 } else { 1 };
     for i in 0..tries {
         unsafe {
@@ -2553,7 +2573,15 @@ fn install_update(url: &str) {
             return Err("tệp tải về bị lỗi".into());
         }
         let _ = std::fs::remove_file(&old);
-        std::fs::rename(&exe, &old).map_err(|_| format!("không ghi được vào {}", exe.parent().map_or_else(String::new, |p| p.display().to_string())))?;
+        if let Err(e) = std::fs::rename(&exe, &old) {
+            // FAT / exFAT drives cannot rename a running exe: the new copy replaces us after we quit
+            let dir = exe.parent().map_or_else(String::new, |p| p.display().to_string());
+            let probe = exe.with_extension("exe.new");
+            std::fs::write(&probe, b"").map_err(|_| format!("không ghi được vào {dir} ({e})"))?;
+            let _ = std::fs::remove_file(&probe);
+            std::process::Command::new(&new).arg(REPLACE_ARG).arg(&exe).spawn().map_err(|e| e.to_string())?;
+            return Ok(());
+        }
         if let Err(e) = std::fs::copy(&new, &exe) {
             let _ = std::fs::rename(&old, &exe); // put the running version back
             return Err(e.to_string());
