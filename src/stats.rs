@@ -32,8 +32,11 @@ pub fn record_key(spent: Duration) {
 
 /// Add a sample: total CPU time used by the process so far, and its memory in bytes.
 pub fn sample(cpu_time: Duration, memory: u64) {
+    sample_at(Instant::now(), cpu_time, memory);
+}
+
+fn sample_at(now: Instant, cpu_time: Duration, memory: u64) {
     let mut g = SAMPLES.lock().unwrap_or_else(|e| e.into_inner());
-    let now = Instant::now();
     let s = g.get_or_insert_with(|| Samples { started: now, last: None, cpu: VecDeque::new(), memory });
     if let Some((at, cpu)) = s.last {
         let wall = now.duration_since(at).as_secs_f32();
@@ -138,11 +141,12 @@ mod tests {
 
     #[test]
     fn cpu_percent_from_samples() {
-        sample(Duration::from_millis(0), 10);
-        std::thread::sleep(Duration::from_millis(50));
-        sample(Duration::from_millis(25), 20);
+        // 25 ms of CPU over 100 ms of wall time
+        let t = Instant::now();
+        sample_at(t, Duration::from_millis(0), 10);
+        sample_at(t + Duration::from_millis(100), Duration::from_millis(25), 20);
         let s = snapshot();
         assert_eq!(s.memory, 20);
-        assert!(s.cpu > 20.0 && s.cpu < 60.0, "{}", s.cpu);
+        assert!((s.cpu - 25.0).abs() < 0.01, "{}", s.cpu);
     }
 }
