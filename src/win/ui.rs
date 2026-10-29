@@ -75,10 +75,12 @@ const INPUT_TYPES: [&str; 4] = ["Telex", "VNI", "Simple Telex 1", "Simple Telex 
 const CODE_TABLES: [&str; 5] = ["Unicode dựng sẵn", "TCVN3 (ABC)", "VNI Windows", "Unicode tổ hợp", "Vietnamese Locale CP 1258"];
 
 /// Card each toggle is shown in
+/// "Chung" holds what most people touch, "Nâng cao" the rest.
+const P_GENERAL: u8 = 9;
 const P_SPELL: u8 = 0;
 const P_QUICK: u8 = 1;
 const P_MACRO: u8 = 2;
-const P_STARTUP: u8 = 3;
+const P_UI: u8 = 3;
 const P_SMART: u8 = 4;
 const P_COMPAT: u8 = 5;
 const P_CONVERT: u8 = 6;
@@ -103,11 +105,11 @@ const fn hk(key: &'static str, bit: i64, default: i64, title: &'static str, page
 }
 
 static TOGGLES: &[Toggle] = &[
-    t("vCheckSpelling", true, "Kiểm tra chính tả", P_SPELL),
+    t("vCheckSpelling", true, "Kiểm tra chính tả", P_GENERAL),
     t("vRestoreIfWrongSpelling", true, "Tự khôi phục phím gõ nếu từ sai chính tả", P_SPELL),
     t("vTempOffSpelling", false, "Tạm tắt kiểm tra chính tả bằng phím Ctrl", P_SPELL),
     t("vAllowConsonantZFWJ", false, "Cho phép phụ âm đầu Z, F, W, J", P_SPELL),
-    t("vUseModernOrthography", false, "Đặt dấu kiểu mới (oà, uý thay vì òa, úy)", P_SPELL),
+    t("vUseModernOrthography", false, "Đặt dấu kiểu mới (oà, uý thay vì òa, úy)", P_GENERAL),
     t("vQuickTelex", false, "Gõ nhanh: cc→ch gg→gi kk→kh nn→ng qq→qu pp→ph tt→th", P_QUICK),
     t("vQuickStartConsonant", false, "Gõ tắt phụ âm đầu: f→ph j→gi w→qu", P_QUICK),
     t("vQuickEndConsonant", false, "Gõ tắt phụ âm cuối: g→ng h→nh k→ch", P_QUICK),
@@ -115,9 +117,9 @@ static TOGGLES: &[Toggle] = &[
     t("vUseMacro", true, "Bật gõ tắt", P_MACRO),
     t("vUseMacroInEnglishMode", false, "Gõ tắt cả khi đang ở chế độ tiếng Anh", P_MACRO),
     t("vAutoCapsMacro", false, "Tự viết hoa theo từ gõ tắt (btw → Btw → BTW)", P_MACRO),
-    t("vRunWithWindows", true, "Khởi động cùng Windows", P_STARTUP),
-    t("vShowOnStartUp", true, "Hiện bảng điều khiển khi khởi động", P_STARTUP),
-    t("vAutoCheckUpdate", true, "Tự kiểm tra bản mới", P_STARTUP),
+    t("vRunWithWindows", true, "Khởi động cùng Windows", P_GENERAL),
+    t("vShowOnStartUp", true, "Hiện bảng điều khiển khi khởi động", P_UI),
+    t("vAutoCheckUpdate", true, "Tự kiểm tra bản mới", P_GENERAL),
     t("vUseSmartSwitchKey", true, "Tự nhớ chế độ gõ Việt / Anh theo từng ứng dụng", P_SMART),
     t("vRememberCode", true, "Tự nhớ bảng mã theo từng ứng dụng", P_SMART),
     t("vTempOffOpenKey", false, "Tạm tắt VKeyEngine bằng phím Alt", P_SMART),
@@ -388,11 +390,13 @@ struct Page {
     natives: Vec<(Native, R)>,
     y: f32,
     w: f32,
+    /// content below this scrolls when the page is too tall (the header above stays)
+    scroll_top: f32,
 }
 
 impl Page {
     fn new(w: f32) -> Page {
-        Page { items: Vec::new(), natives: Vec::new(), y: 0.0, w }
+        Page { items: Vec::new(), natives: Vec::new(), y: 0.0, w, scroll_top: 0.0 }
     }
 
     fn text(&mut self, r: R, s: &str, size: f32, bold: bool, secondary: bool) {
@@ -526,6 +530,10 @@ struct Win {
     /// client size in DIPs
     width: f32,
     height: f32,
+    /// full content height, the scrolling part's top, and how far it is scrolled
+    content_h: f32,
+    scroll_top: f32,
+    scroll: f32,
     hover: Option<usize>,
     focus: Option<usize>,
     /// hot key being recorded (T_RECORD_*)
@@ -1181,23 +1189,21 @@ fn build(kind: Kind, page: usize) -> Page {
     match kind {
         Kind::Settings => {
             p.header("VKeyEngine", &format!("Bộ gõ tiếng Việt · phiên bản {}", env!("CARGO_PKG_VERSION")));
-            let labels: &[&str] = &["Bộ gõ", "Gõ tắt", "Hệ thống", "Hoạt động"];
+            let labels: &[&str] = &["Chung", "Gõ tắt", "Nâng cao", "Hoạt động"];
             p.items.push(Item::Segment { r: R { x: 580.0 - PAD - 340.0, y: 28.0, w: 340.0, h: 30.0 }, labels, tag: T_PAGE });
+            p.scroll_top = p.y; // the header stays put when the page scrolls
             match page {
                 0 => {
-                    let beep = toggle_index("vSwitchKeyStatus", hotkey::BEEP);
                     p.section("Bộ gõ");
                     p.card(vec![
                         (POPUPS[POP_LANG].label, Ctl::Popup(POP_LANG, 200.0)),
                         (POPUPS[POP_INPUT].label, Ctl::Popup(POP_INPUT, 200.0)),
                         (POPUPS[POP_CODE].label, Ctl::Popup(POP_CODE, 200.0)),
                         ("Phím chuyển Việt / Anh", Ctl::Hotkey(P_SWITCH_KEY, T_RECORD_SWITCH)),
-                        (TOGGLES[beep].title, Ctl::Switch(beep)),
                     ]);
-                    p.section("Chính tả");
-                    p.toggle_card(P_SPELL);
-                    p.section("Gõ nhanh");
-                    p.toggle_card(P_QUICK);
+                    p.section("Tuỳ chọn");
+                    p.toggle_card(P_GENERAL);
+                    p.buttons(&[("Kiểm tra bản mới", T_CHECK_UPDATE)], &[("Thoát VKeyEngine", T_QUIT)], 0);
                 }
                 1 => {
                     p.section("Gõ tắt");
@@ -1218,13 +1224,20 @@ fn build(kind: Kind, page: usize) -> Page {
                     p.note("Cập nhật mỗi 2 giây. Khi để không, VKeyEngine gần như không dùng CPU.");
                 }
                 _ => {
-                    p.section("Khởi động");
-                    p.toggle_card(P_STARTUP);
+                    p.section("Chính tả");
+                    p.toggle_card(P_SPELL);
+                    p.section("Gõ nhanh");
+                    p.toggle_card(P_QUICK);
                     p.section("Tự động chuyển");
                     p.toggle_card(P_SMART);
+                    p.section("Âm thanh & giao diện");
+                    let beep = toggle_index("vSwitchKeyStatus", hotkey::BEEP);
+                    let mut rows = vec![(TOGGLES[beep].title, Ctl::Switch(beep))];
+                    rows.extend((0..TOGGLES.len()).filter(|&i| TOGGLES[i].page == P_UI).map(|i| (TOGGLES[i].title, Ctl::Switch(i))));
+                    p.card(rows);
                     p.section("Tương thích");
                     p.toggle_card(P_COMPAT);
-                    p.buttons(&[("Khôi phục mặc định", T_DEFAULTS)], &[("Thoát VKeyEngine", T_QUIT)], 0);
+                    p.buttons(&[("Khôi phục mặc định", T_DEFAULTS)], &[], 0);
                 }
             }
         }
@@ -1288,6 +1301,8 @@ fn build(kind: Kind, page: usize) -> Page {
 }
 
 const ACTIVITY_PAGE: usize = 3;
+/// Settings pages taller than this scroll, so the window fits a 13" screen.
+const MAX_PAGE_H: f32 = 540.0;
 const ACTIVITY_ROWS: [&str; 7] = [
     "Bộ nhớ (RAM)",
     "CPU hiện tại",
@@ -1370,6 +1385,9 @@ fn show(kind: Kind) {
             natives: Vec::new(),
             width: 0.0,
             height: 0.0,
+            content_h: 0.0,
+            scroll_top: 0.0,
+            scroll: 0.0,
             hover: None,
             focus: None,
             recording: None,
@@ -1402,13 +1420,18 @@ fn load_page(hwnd: HWND, page: usize) {
         unsafe { DestroyWindow(h) };
     }
     let natives: Vec<(HWND, R)> = p.natives.iter().map(|(n, r)| (create_native(hwnd, n), *r)).collect();
-    let (w, h) = (p.w, p.y);
+    let (w, content_h, top) = (p.w, p.y, p.scroll_top);
+    // taller than a laptop screen allows: show MAX_PAGE_H of it and scroll
+    let h = if content_h - top > MAX_PAGE_H { top + MAX_PAGE_H } else { content_h };
     with_win(hwnd, |win| {
         win.page = page;
         win.items = p.items;
         win.natives = natives;
         win.width = w;
         win.height = h;
+        win.content_h = content_h;
+        win.scroll_top = top;
+        win.scroll = 0.0;
         win.hover = None;
         win.focus = None;
         win.recording = None;
@@ -1585,9 +1608,9 @@ fn paint(hwnd: HWND) {
     let t = theme();
     let s = scale(hwnd);
     // the items are taken out while painting, so nothing below borrows the window state
-    let Some((items, page, hover, focus, recording)) =
-        with_win(hwnd, |w| (std::mem::take(&mut w.items), w.page, w.hover, w.focus, w.recording))
-    else {
+    let Some((items, page, hover, focus, recording, (content_h, top, scroll, view_h))) = with_win(hwnd, |w| {
+        (std::mem::take(&mut w.items), w.page, w.hover, w.focus, w.recording, (w.content_h, w.scroll_top, w.scroll, w.height))
+    }) else {
         return;
     };
     unsafe {
@@ -1595,11 +1618,13 @@ fn paint(hwnd: HWND) {
         let hdc = BeginPaint(hwnd, &mut ps);
         let mut rc = RECT { left: 0, top: 0, right: 0, bottom: 0 };
         GetClientRect(hwnd, &mut rc);
+        // The whole content is drawn unscrolled; the part below `top` is copied with an offset.
+        let full = RECT { left: 0, top: 0, right: rc.right, bottom: rc.bottom.max((content_h * s).ceil() as i32) };
         let mem = CreateCompatibleDC(hdc);
-        let bmp = CreateCompatibleBitmap(hdc, rc.right.max(1), rc.bottom.max(1));
+        let bmp = CreateCompatibleBitmap(hdc, full.right.max(1), full.bottom.max(1));
         let old_bmp = SelectObject(mem, bmp);
         let bg = CreateSolidBrush(colorref(t.bg));
-        FillRect(mem, &rc, bg);
+        FillRect(mem, &full, bg);
         DeleteObject(bg);
 
         // shapes
@@ -1675,6 +1700,13 @@ fn paint(hwnd: HWND) {
                 g.rounded(ring, 8.0, s, None, Some(argb(t.accent, 160)));
             }
         }
+        let (area, max_scroll) = (view_h - top, content_h - view_h);
+        if max_scroll > 0.0 {
+            // scroll indicator, placed where it lands after the offset copy
+            let bar_h = (area * area / (content_h - top)).max(24.0);
+            let bar = R { x: 580.0 - 7.0, y: top + scroll + 4.0 + (area - bar_h - 8.0) * scroll / max_scroll, w: 4.0, h: bar_h };
+            g.rounded(bar, 2.0, s, Some(argb(t.secondary, 140)), None);
+        }
         GdipDeleteGraphics(g.0);
 
         // text and icons
@@ -1737,7 +1769,9 @@ fn paint(hwnd: HWND) {
                 _ => {}
             }
         }
-        BitBlt(hdc, 0, 0, rc.right, rc.bottom, mem, 0, 0, SRCCOPY);
+        let (top_px, scroll_px) = ((top * s) as i32, (scroll * s) as i32);
+        BitBlt(hdc, 0, 0, rc.right, top_px, mem, 0, 0, SRCCOPY);
+        BitBlt(hdc, 0, top_px, rc.right, rc.bottom - top_px, mem, 0, top_px + scroll_px, SRCCOPY);
         SelectObject(mem, old_bmp);
         DeleteObject(bmp);
         DeleteDC(mem);
@@ -1755,8 +1789,43 @@ fn dip_point(hwnd: HWND, lparam: LPARAM) -> (f32, f32) {
     (x, y)
 }
 
+/// Window point -> content point (below the header, the content is scrolled).
+fn content_y(hwnd: HWND, y: f32) -> f32 {
+    with_win(hwnd, |w| if y >= w.scroll_top { y + w.scroll } else { y }).unwrap_or(y)
+}
+
 fn hit(hwnd: HWND, x: f32, y: f32) -> Option<usize> {
+    let y = content_y(hwnd, y);
     with_win(hwnd, |w| w.items.iter().position(|i| i.interactive() && i.rect().contains(x, y))).flatten()
+}
+
+/// Scroll by `dy` DIPs (or to show `item`), within the content.
+fn scroll_by(hwnd: HWND, dy: f32) {
+    let changed = with_win(hwnd, |w| {
+        let max = (w.content_h - w.height).max(0.0);
+        let new = (w.scroll + dy).clamp(0.0, max);
+        std::mem::replace(&mut w.scroll, new) != new
+    });
+    if changed == Some(true) {
+        unsafe { InvalidateRect(hwnd, null(), 0) };
+    }
+}
+
+fn scroll_into_view(hwnd: HWND, item: usize) {
+    let Some(dy) = with_win(hwnd, |w| {
+        let r = w.items[item].rect();
+        let (from, to) = (w.scroll_top + w.scroll, w.height + w.scroll);
+        if r.y < from {
+            r.y - from - 8.0
+        } else if r.y + r.h > to {
+            r.y + r.h - to + 8.0
+        } else {
+            0.0
+        }
+    }) else {
+        return;
+    };
+    scroll_by(hwnd, dy);
 }
 
 /// Tag an item triggers when clicked at (x, y).
@@ -1808,6 +1877,11 @@ unsafe extern "system" fn win_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
             }
             0
         }
+        WM_MOUSEWHEEL => {
+            let delta = ((wparam >> 16) & 0xFFFF) as i16 as f32 / 120.0; // notches, up = positive
+            scroll_by(hwnd, -delta * 48.0);
+            0
+        }
         WM_MOUSELEAVE => {
             with_win(hwnd, |w| w.hover = None);
             InvalidateRect(hwnd, null(), 0);
@@ -1848,6 +1922,9 @@ unsafe extern "system" fn win_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
                         };
                         w.focus = Some(idx[next]);
                     });
+                    if let Some(Some(f)) = with_win(hwnd, |w| w.focus) {
+                        scroll_into_view(hwnd, f);
+                    }
                     InvalidateRect(hwnd, null(), 0);
                 }
                 VK_SPACE | VK_RETURN => {

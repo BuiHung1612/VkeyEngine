@@ -48,11 +48,12 @@ const T_CLOSE: isize = 502;
 const INPUT_TYPES: [&str; 4] = ["Telex", "VNI", "Simple Telex 1", "Simple Telex 2"];
 const CODE_TABLES: [&str; 5] = ["Unicode dựng sẵn", "TCVN3 (ABC)", "VNI Windows", "Unicode tổ hợp", "Vietnamese Locale CP 1258"];
 
-/// Card each toggle is shown in
+/// Card each toggle is shown in. "Chung" holds what most people touch, "Nâng cao" the rest.
+const P_GENERAL: u8 = 9;
 const P_SPELL: u8 = 0;
 const P_QUICK: u8 = 1;
 const P_MACRO: u8 = 2;
-const P_STARTUP: u8 = 3;
+const P_UI: u8 = 3;
 const P_SMART: u8 = 4;
 const P_COMPAT: u8 = 5;
 const P_CONVERT: u8 = 6;
@@ -77,11 +78,11 @@ const fn hk(key: &'static str, bit: i64, default: i64, title: &'static str, page
 }
 
 static TOGGLES: &[Toggle] = &[
-    t("Spelling", true, "Kiểm tra chính tả", P_SPELL),
+    t("Spelling", true, "Kiểm tra chính tả", P_GENERAL),
     t("RestoreIfInvalidWord", false, "Tự khôi phục phím gõ nếu từ sai chính tả", P_SPELL),
     t("vTempOffSpelling", false, "Tạm tắt kiểm tra chính tả bằng phím ⌃", P_SPELL),
     t("vAllowConsonantZFWJ", false, "Cho phép phụ âm đầu Z, F, W, J", P_SPELL),
-    t("ModernOrthography", false, "Đặt dấu kiểu mới (oà, uý thay vì òa, úy)", P_SPELL),
+    t("ModernOrthography", false, "Đặt dấu kiểu mới (oà, uý thay vì òa, úy)", P_GENERAL),
     t("QuickTelex", false, "Gõ nhanh: cc→ch gg→gi kk→kh nn→ng qq→qu pp→ph tt→th", P_QUICK),
     t("vQuickStartConsonant", false, "Gõ tắt phụ âm đầu: f→ph j→gi w→qu", P_QUICK),
     t("vQuickEndConsonant", false, "Gõ tắt phụ âm cuối: g→ng h→nh k→ch", P_QUICK),
@@ -89,10 +90,10 @@ static TOGGLES: &[Toggle] = &[
     t("UseMacro", true, "Bật gõ tắt", P_MACRO),
     t("UseMacroInEnglishMode", false, "Gõ tắt cả khi đang ở chế độ tiếng Anh", P_MACRO),
     t("vAutoCapsMacro", false, "Tự viết hoa theo từ gõ tắt (btw → Btw → BTW)", P_MACRO),
-    t("RunOnStartup", true, "Khởi động cùng hệ thống", P_STARTUP),
-    t("ShowUIOnStartup", false, "Hiện bảng điều khiển khi khởi động", P_STARTUP),
-    t("CheckUpdate", true, "Tự kiểm tra bản mới", P_STARTUP),
-    t("vShowIconOnDock", false, "Hiện biểu tượng trên Dock", P_STARTUP),
+    t("RunOnStartup", true, "Khởi động cùng hệ thống", P_GENERAL),
+    t("ShowUIOnStartup", false, "Hiện bảng điều khiển khi khởi động", P_UI),
+    t("CheckUpdate", true, "Tự kiểm tra bản mới", P_GENERAL),
+    t("vShowIconOnDock", false, "Hiện biểu tượng trên Dock", P_UI),
     t("UseSmartSwitchKey", true, "Tự nhớ chế độ gõ Việt / Anh theo từng ứng dụng", P_SMART),
     t("vRememberCode", true, "Tự nhớ bảng mã theo từng ứng dụng", P_SMART),
     t("vOtherLanguage", true, "Tắt tiếng Việt khi dùng bàn phím ngôn ngữ khác", P_SMART),
@@ -1296,7 +1297,7 @@ pub fn show_settings() {
     let w = 580.0;
     let mut root = Page::new(w);
     root.header("VKeyEngine", &format!("Bộ gõ tiếng Việt · phiên bản {}", version()));
-    let labels: Vec<Retained<NSString>> = ["Bộ gõ", "Gõ tắt", "Hệ thống", "Hoạt động"].iter().map(|s| ns(s)).collect();
+    let labels: Vec<Retained<NSString>> = ["Chung", "Gõ tắt", "Nâng cao", "Hoạt động"].iter().map(|s| ns(s)).collect();
     let seg = unsafe {
         NSSegmentedControl::segmentedControlWithLabels_trackingMode_target_action(
             &NSArray::from_retained_slice(&labels),
@@ -1320,12 +1321,10 @@ pub fn show_settings() {
                 (POPUPS[POP_INPUT].label, popup(POP_INPUT, 200.0)),
                 (POPUPS[POP_CODE].label, popup(POP_CODE, 200.0)),
                 ("Phím chuyển Việt / Anh", hotkey_control(P_SWITCH_KEY, T_RECORD_SWITCH)),
-                (TOGGLES[toggle_index("SwitchKeyStatus", hotkey::BEEP)].title, switch(toggle_index("SwitchKeyStatus", hotkey::BEEP))),
             ]);
-            p.section("Chính tả");
-            p.toggle_card(P_SPELL);
-            p.section("Gõ nhanh");
-            p.toggle_card(P_QUICK);
+            p.section("Tuỳ chọn");
+            p.toggle_card(P_GENERAL);
+            p.buttons(&[("Kiểm tra bản mới", T_CHECK_UPDATE)], &[("Thoát VKeyEngine", T_QUIT)], 0);
         },
         &|p| {
             p.section("Gõ tắt");
@@ -1334,13 +1333,20 @@ pub fn show_settings() {
             p.buttons(&[], &[("Bảng gõ tắt…", T_MACROS)], 0);
         },
         &|p| {
-            p.section("Khởi động & giao diện");
-            p.toggle_card(P_STARTUP);
+            p.section("Chính tả");
+            p.toggle_card(P_SPELL);
+            p.section("Gõ nhanh");
+            p.toggle_card(P_QUICK);
             p.section("Tự động chuyển");
             p.toggle_card(P_SMART);
+            p.section("Âm thanh & giao diện");
+            let beep = toggle_index("SwitchKeyStatus", hotkey::BEEP);
+            let mut rows = vec![(TOGGLES[beep].title, switch(beep))];
+            rows.extend(TOGGLES.iter().enumerate().filter(|(_, t)| t.page == P_UI).map(|(i, t)| (t.title, switch(i))));
+            p.card(rows);
             p.section("Tương thích");
             p.toggle_card(P_COMPAT);
-            p.buttons(&[("Khôi phục mặc định", T_DEFAULTS)], &[("Thoát VKeyEngine", T_QUIT)], 0);
+            p.buttons(&[("Khôi phục mặc định", T_DEFAULTS)], &[], 0);
         },
         &|p| {
             p.section("CPU · 2 phút gần nhất");
@@ -1370,9 +1376,20 @@ pub fn show_settings() {
             let mut p = Page::new(w);
             b(&mut p);
             let h = p.finish();
-            p.view.setFrameOrigin(NSPoint::new(0.0, top));
-            root.add(&p.view);
-            (p.view, h)
+            if h <= MAX_PAGE_H {
+                p.view.setFrameOrigin(NSPoint::new(0.0, top));
+                root.add(&p.view);
+                return (p.view, h);
+            }
+            // taller than a laptop screen allows: scroll it
+            let scroll = NSScrollView::initWithFrame(NSScrollView::alloc(mtm()), rect(0.0, top, w, MAX_PAGE_H));
+            scroll.setDocumentView(Some(&p.view));
+            scroll.setHasVerticalScroller(true);
+            scroll.setAutohidesScrollers(true);
+            scroll.setDrawsBackground(false);
+            scroll.setBorderType(NSBorderType::NoBorder);
+            root.add(&scroll);
+            (Retained::into_super(scroll), MAX_PAGE_H)
         })
         .collect();
     let win = new_window(&format!("VKeyEngine {}", version()), &mut root);
@@ -1402,6 +1419,8 @@ fn show_page(i: usize) {
 }
 
 const ACTIVITY_PAGE: usize = 3;
+/// Settings pages taller than this scroll, so the window fits a 13" screen.
+const MAX_PAGE_H: f64 = 540.0;
 const ACTIVITY_ROWS: [&str; 7] = [
     "Bộ nhớ (RAM)",
     "CPU hiện tại",
