@@ -32,6 +32,8 @@ const T_ABOUT: isize = 34;
 const T_QUIT: isize = 35;
 const T_PAGE: isize = 36;
 const T_CHECK_UPDATE: isize = 37;
+const T_EXCLUDE: isize = 38;
+const T_EXCLUDE_CLEAR: isize = 39;
 const T_TOGGLE: isize = 100; // + index in TOGGLES
 const T_POPUP: isize = 200; // + index in POPUPS
 const T_RECORD_SWITCH: isize = 300;
@@ -198,6 +200,9 @@ struct Ui {
     menu_title: Option<Retained<NSTextField>>,
     menu_status: Option<Retained<NSTextField>>,
     menu_input_holder: Option<Retained<NSMenuItem>>,
+    menu_exclude: Option<Retained<NSMenuItem>>,
+    /// "Nâng cao" page: names of the excluded apps
+    exclude_value: Option<Retained<NSTextField>>,
     menu_input: Vec<Retained<NSMenuItem>>,
     menu_code: Vec<Retained<NSMenuItem>>,
     menu_quick_convert: Option<Retained<NSMenuItem>>,
@@ -292,6 +297,7 @@ define_class!(
         #[unsafe(method(appActivated:))]
         fn app_activated(&self, _n: &NSNotification) {
             with_app(|a| a.on_active_app_changed());
+            refresh(); // the "Không gõ tiếng Việt trong …" item names the new app
         }
 
         #[unsafe(method(inputSourceChanged:))]
@@ -311,6 +317,7 @@ define_class!(
 
         #[unsafe(method(applicationWillTerminate:))]
         fn will_terminate(&self, _n: &NSNotification) {
+            save_typing_stats();
             // turned off while running as the agent: unregistering earlier would have killed us
             if !prefs::flag("RunOnStartup", true) {
                 sys::set_run_at_login(false);
@@ -505,6 +512,7 @@ fn did_finish_launching() {
     if at_login || !sys::under_launch_agent() {
         sys::set_run_at_login(at_login);
     }
+    crate::stats::load_typing(&prefs::data("TypingStats"), sys::today());
     start_watchdog();
     start_update_checks();
     if !start_tap() {
@@ -561,7 +569,20 @@ fn watchdog() {
     }
     let (cpu, memory) = sys::process_usage();
     crate::stats::sample(cpu, memory);
+    crate::stats::set_day(sys::today());
+    thread_local! {
+        static TICKS: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+    }
+    if TICKS.with(|t| t.replace(t.get() + 1)).is_multiple_of(30) {
+        save_typing_stats(); // once a minute, only if something changed
+    }
     update_activity();
+}
+
+fn save_typing_stats() {
+    if let Some(bytes) = crate::stats::take_saved_typing() {
+        prefs::set_data("TypingStats", &bytes);
+    }
 }
 
 fn register_notifications() {
@@ -640,7 +661,8 @@ fn menu_header() -> Retained<NSMenuItem> {
     let mtm = mtm();
     let (w, h) = (290.0, 62.0);
     let view = NSView::initWithFrame(NSView::alloc(mtm), rect(0.0, 0.0, w, h));
-    if let Some(icon) = NSApplication::sharedApplication(mtm).applicationIconImage() {
+    {
+        let icon = app_icon();
         let v = NSImageView::imageViewWithImage(&icon, mtm);
         v.setFrame(rect(12.0, 13.0, 36.0, 36.0));
         view.addSubview(&v);
@@ -681,6 +703,9 @@ fn create_status_item() {
     menu.addItem(&menu_header());
     menu.addItem(&NSMenuItem::separatorItem(mtm));
     let inputs: Vec<_> = INPUT_TYPES.iter().enumerate().map(|(i, s)| menu_item(s, T_INPUT + i as isize, "")).collect();
+    let exclude = with_symbol(menu_item("Không gõ tiếng Việt trong ứng dụng này", T_EXCLUDE, ""), "nosign");
+    menu.addItem(&exclude);
+    menu.addItem(&NSMenuItem::separatorItem(mtm));
     let input_holder = with_symbol(submenu(&menu, "Kiểu gõ", &inputs), "keyboard");
     menu.addItem(&NSMenuItem::separatorItem(mtm));
     section_header(&menu, "Bảng mã");
@@ -705,6 +730,7 @@ fn create_status_item() {
     ui(|u| {
         u.status_item = Some(item);
         u.menu_input_holder = Some(input_holder);
+        u.menu_exclude = Some(exclude);
         u.menu_input = inputs;
         u.menu_code = codes;
         u.menu_quick_convert = Some(quick);
@@ -723,10 +749,16 @@ fn on_off(b: bool) -> isize {
 /// Update the menu and all open windows from the preferences.
 pub fn refresh() {
     let (s, o) = read_settings();
+    let (excluded, front_name, excluded_names) = with_app(|a| {
+        let names: Vec<String> = a.excluded.iter().map(|id| sys::app_name(id)).collect();
+        (a.front_excluded(), a.front_name.clone(), names)
+    })
+    .unwrap_or_default();
     let spelling = s.check_spelling;
     ui(|u| {
         if let Some(button) = u.status_item.as_ref().and_then(|i| i.button(mtm())) {
-            let name = if s.language == 1 { "Status" } else { "StatusEng" };
+            // "E" while typing goes untouched (English, or an excluded app)
+            let name = if s.language == 1 && !excluded { "Status" } else { "StatusEng" };
             if let Some(img) = NSImage::imageNamed(&ns(name)) {
                 img.setTemplate(true); // black glyph, recolored by macOS for light / dark menu bars
                 button.setImage(Some(&img));
@@ -751,6 +783,8 @@ pub fn refresh() {
                 "⚠ Chưa có quyền Trợ năng (Accessibility)".to_string()
             } else if let Some(app) = &u.health.secure_input {
                 format!("⚠ {app} đang chặn bàn phím (Secure Input)")
+            } else if excluded {
+                format!("Đang tắt trong {front_name}")
             } else if key.is_empty() {
                 format!("{input} · {code}")
             } else {
@@ -760,6 +794,15 @@ pub fn refresh() {
         }
         if let Some(m) = &u.menu_input_holder {
             m.setTitle(&ns(&format!("Kiểu gõ: {input}")));
+        }
+        if let Some(m) = &u.menu_exclude {
+            let app = if front_name.is_empty() { "ứng dụng này".to_string() } else { front_name.clone() };
+            m.setTitle(&ns(&format!("Không gõ tiếng Việt trong {app}")));
+            m.setState(on_off(excluded));
+            m.setEnabled(!front_name.is_empty());
+        }
+        if let Some(l) = &u.exclude_value {
+            l.setStringValue(&ns(&if excluded_names.is_empty() { "Chưa có".into() } else { excluded_names.join(", ") }));
         }
         for (i, m) in u.menu_input.iter().enumerate() {
             m.setState(on_off(i == s.input_type as usize));
@@ -828,6 +871,17 @@ fn action(tag: isize, sender: &AnyObject) {
         }
         T_MACROS => show_macros(),
         T_ABOUT => show_about(),
+        T_EXCLUDE => {
+            with_app(|a| a.toggle_front_excluded());
+            refresh();
+        }
+        T_EXCLUDE_CLEAR => {
+            with_app(|a| {
+                a.excluded.clear();
+                a.save_excluded();
+            });
+            refresh();
+        }
         T_CHECK_UPDATE => {
             std::thread::spawn(|| check_update(true));
         }
@@ -1279,6 +1333,12 @@ fn present(win: &NSWindow) {
     win.makeKeyAndOrderFront(None);
 }
 
+/// The app icon as macOS draws it (masked to the system shape; the file itself is a full
+/// square, which macOS 26+ needs to not shrink it into a gray frame).
+fn app_icon() -> Retained<NSImage> {
+    NSWorkspace::sharedWorkspace().iconForFile(&NSBundle::mainBundle().bundlePath())
+}
+
 fn version() -> String {
     NSBundle::mainBundle()
         .objectForInfoDictionaryKey(&ns("CFBundleShortVersionString"))
@@ -1346,9 +1406,22 @@ pub fn show_settings() {
             p.card(rows);
             p.section("Tương thích");
             p.toggle_card(P_COMPAT);
-            p.buttons(&[("Khôi phục mặc định", T_DEFAULTS)], &[], 0);
+            p.section("Ứng dụng loại trừ");
+            let names = text("Chưa có", 13.0, false, true);
+            names.setAlignment(NSTextAlignment::Right);
+            names.setLineBreakMode(NSLineBreakMode::ByTruncatingTail);
+            names.setFrameSize(NSSize::new(300.0, 17.0));
+            ui(|u| u.exclude_value = Some(names.clone()));
+            p.card(vec![("Không gõ tiếng Việt trong", Retained::into_super(Retained::into_super(names)))]);
+            p.note("Đang ở ứng dụng cần loại trừ (Terminal, IDE, game…), chọn \"Không gõ tiếng Việt trong …\" trên menu.");
+            p.buttons(&[("Khôi phục mặc định", T_DEFAULTS)], &[("Bỏ loại trừ tất cả", T_EXCLUDE_CLEAR)], 0);
         },
         &|p| {
+            let rows = |p: &mut Page, range: std::ops::Range<usize>| {
+                p.card(ACTIVITY_ROWS[range].iter().map(|&label| (label, activity_value())).collect());
+            };
+            p.section("Hôm nay");
+            rows(p, 0..4);
             p.section("CPU · 2 phút gần nhất");
             let (cw, ch) = (p.w - 2.0 * PAD, 96.0);
             let graph_card = card(PAD, p.y, cw, ch);
@@ -1359,13 +1432,11 @@ pub fn show_settings() {
             p.add(&graph_card);
             p.y += ch;
             ui(|u| u.cpu_graph = Some(graph));
-            let rows = |p: &mut Page, range: std::ops::Range<usize>| {
-                p.card(ACTIVITY_ROWS[range].iter().map(|&label| (label, activity_value())).collect());
-            };
             p.section("Tài nguyên");
-            rows(p, 0..3);
+            rows(p, 4..7);
             p.section("Bộ gõ");
-            rows(p, 3..7);
+            rows(p, 7..11);
+            p.note("Thống kê chỉ đếm số lượng, không lưu nội dung bạn gõ.");
             p.note("Cập nhật mỗi 2 giây. Khi để không, VKeyEngine gần như không dùng CPU.");
         },
     ];
@@ -1421,7 +1492,11 @@ fn show_page(i: usize) {
 const ACTIVITY_PAGE: usize = 3;
 /// Settings pages taller than this scroll, so the window fits a 13" screen.
 const MAX_PAGE_H: f64 = 540.0;
-const ACTIVITY_ROWS: [&str; 7] = [
+const ACTIVITY_ROWS: [&str; 11] = [
+    "Số từ đã gõ",
+    "Tốc độ (từ / phút)",
+    "Nhanh nhất hôm nay",
+    "Gõ tắt dùng nhiều nhất",
     "Bộ nhớ (RAM)",
     "CPU hiện tại",
     "Thời gian chạy",
@@ -1449,17 +1524,25 @@ fn update_activity() {
     };
     use crate::stats;
     let s = stats::snapshot();
+    let t = stats::typing_snapshot();
     let vietnamese = read_settings().0.language == 1;
+    let excluded = with_app(|a| a.front_excluded().then(|| a.front_name.clone())).flatten();
     let status = if health.no_permission {
         "⚠ Chưa có quyền Trợ năng".to_string()
     } else if let Some(app) = &health.secure_input {
         format!("⚠ Bị chặn bởi {app}")
+    } else if let Some(app) = excluded {
+        format!("Đang tắt trong {app}")
     } else if vietnamese {
         "Đang hoạt động · Tiếng Việt".to_string()
     } else {
         "Đang hoạt động · Tiếng Anh".to_string()
     };
     let texts = [
+        stats::thousands(t.words),
+        t.wpm.to_string(),
+        format!("{} từ / phút", t.best_wpm),
+        stats::top_macros(&t.top_macros),
         stats::memory(s.memory),
         stats::percent(s.cpu),
         stats::duration(s.uptime),
@@ -1512,7 +1595,8 @@ pub fn show_about() {
     let w = 360.0;
     let mut p = Page::new(w);
     p.y = TITLEBAR;
-    if let Some(icon) = NSApplication::sharedApplication(mtm()).applicationIconImage() {
+    {
+        let icon = app_icon();
         let v = NSImageView::imageViewWithImage(&icon, mtm());
         v.setFrame(rect((w - 80.0) / 2.0, p.y, 80.0, 80.0));
         p.add(&v);

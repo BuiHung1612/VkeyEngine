@@ -76,6 +76,8 @@ pub struct App {
     pub hook: hook::Hook,
     /// executable name of the foreground app, e.g. "chrome.exe"
     pub front_app: String,
+    /// executables where VKeyEngine stays out of the way (lowercase)
+    pub excluded: Vec<String>,
 }
 
 pub static APP: Mutex<Option<App>> = Mutex::new(None);
@@ -148,7 +150,8 @@ impl App {
         engine.macros.load_binary(&reg::data("macroData"), table);
         let mut smart = SmartSwitch::default();
         smart.load_binary(&reg::data("smartSwitchKey"));
-        App { engine, opt, smart, hook: hook::Hook::default(), front_app: String::new() }
+        let excluded = String::from_utf8_lossy(&reg::data("ExcludedApps")).lines().filter(|l| !l.is_empty()).map(str::to_string).collect();
+        App { engine, opt, smart, hook: hook::Hook::default(), front_app: String::new(), excluded }
     }
 
     /// Re-read settings after the UI changed them.
@@ -166,6 +169,31 @@ impl App {
             self.on_language_changed();
         }
         self.opt = opt;
+    }
+
+    /// Keys go through untouched in the foreground app (it is in the exclusion list).
+    pub fn front_excluded(&self) -> bool {
+        self.excluded.contains(&self.front_app.to_lowercase())
+    }
+
+    /// Add or remove the foreground app from the exclusion list.
+    pub fn toggle_front_excluded(&mut self) {
+        if self.front_app.is_empty() {
+            return;
+        }
+        let app = self.front_app.to_lowercase();
+        if self.front_excluded() {
+            self.excluded.retain(|a| *a != app);
+        } else {
+            self.excluded.push(app);
+        }
+        self.save_excluded();
+        self.engine.start_new_session();
+        self.hook.sync_key.clear();
+    }
+
+    pub fn save_excluded(&self) {
+        reg::set_data("ExcludedApps", self.excluded.join("\n").as_bytes());
     }
 
     pub fn save_macros(&self) {
@@ -244,6 +272,13 @@ impl App {
             }
         }
     }
+}
+
+/// Local date as yyyymmdd.
+pub fn today() -> u32 {
+    let mut t: windows_sys::Win32::Foundation::SYSTEMTIME = unsafe { std::mem::zeroed() };
+    unsafe { windows_sys::Win32::System::SystemInformation::GetLocalTime(&mut t) };
+    t.wYear as u32 * 10000 + t.wMonth as u32 * 100 + t.wDay as u32
 }
 
 /// CPU time used by this process, and its private memory.

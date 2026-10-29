@@ -70,8 +70,11 @@ pub struct App {
     pub opt: Options,
     pub smart: SmartSwitch,
     pub tap: tap::Tap,
-    /// bundle id of the frontmost app other than VKeyEngine
+    /// bundle id and name of the frontmost app other than VKeyEngine
     pub front_app: String,
+    pub front_name: String,
+    /// bundle ids of the apps where VKeyEngine stays out of the way
+    pub excluded: Vec<String>,
     pub english_input_source: bool,
 }
 
@@ -154,6 +157,8 @@ impl App {
             smart,
             tap: tap::Tap::new(),
             front_app: String::new(),
+            front_name: String::new(),
+            excluded: lines(&prefs::data("ExcludedApps")),
             english_input_source: sys::input_source_is_english(),
         }
     }
@@ -173,6 +178,30 @@ impl App {
             self.on_language_changed();
         }
         self.opt = opt;
+    }
+
+    /// Keys go through untouched in the frontmost app (it is in the exclusion list).
+    pub fn front_excluded(&self) -> bool {
+        self.excluded.contains(&self.front_app)
+    }
+
+    /// Add or remove the frontmost app from the exclusion list.
+    pub fn toggle_front_excluded(&mut self) {
+        if self.front_app.is_empty() {
+            return;
+        }
+        if self.front_excluded() {
+            self.excluded.retain(|a| *a != self.front_app);
+        } else {
+            self.excluded.push(self.front_app.clone());
+        }
+        self.save_excluded();
+        self.engine.start_new_session();
+        self.tap.clear_sync();
+    }
+
+    pub fn save_excluded(&self) {
+        prefs::set_data("ExcludedApps", self.excluded.join("\n").as_bytes());
     }
 
     pub fn save_macros(&self) {
@@ -234,6 +263,7 @@ impl App {
         if id == BUNDLE_ID {
             return;
         }
+        self.front_name = app.localizedName().map(|s| s.to_string()).unwrap_or_else(|| id.clone());
         self.front_app = id;
         self.engine.start_new_session();
         self.tap.clear_sync();
@@ -261,6 +291,11 @@ impl App {
             }
         }
     }
+}
+
+/// Non-empty lines of a UTF-8 blob.
+fn lines(bytes: &[u8]) -> Vec<String> {
+    String::from_utf8_lossy(bytes).lines().filter(|l| !l.is_empty()).map(str::to_string).collect()
 }
 
 /// Run the app (never returns).

@@ -235,6 +235,44 @@ pub fn process_usage() -> (std::time::Duration, u64) {
     (std::time::Duration::new(t.sec as u64, t.nsec as u32), info.phys_footprint)
 }
 
+/// Display name of an installed app from its bundle id (the id itself if not found).
+pub fn app_name(bundle_id: &str) -> String {
+    use objc2_app_kit::NSWorkspace;
+    NSWorkspace::sharedWorkspace()
+        .URLForApplicationWithBundleIdentifier(&NSString::from_str(bundle_id))
+        .and_then(|u| u.URLByDeletingPathExtension())
+        .and_then(|u| u.lastPathComponent())
+        .map_or_else(|| bundle_id.to_string(), |s| s.to_string())
+}
+
+/// Local date as yyyymmdd.
+pub fn today() -> u32 {
+    #[repr(C)]
+    struct Tm {
+        sec: i32,
+        min: i32,
+        hour: i32,
+        mday: i32,
+        mon: i32,
+        year: i32,
+        wday: i32,
+        yday: i32,
+        isdst: i32,
+        gmtoff: std::ffi::c_long,
+        zone: *const std::ffi::c_char,
+    }
+    extern "C" {
+        fn time(t: *mut i64) -> i64;
+        fn localtime_r(t: *const i64, tm: *mut Tm) -> *mut Tm;
+    }
+    unsafe {
+        let now = time(std::ptr::null_mut());
+        let mut tm: Tm = std::mem::zeroed();
+        localtime_r(&now, &mut tm);
+        ((tm.year + 1900) * 10000 + (tm.mon + 1) * 100 + tm.mday) as u32
+    }
+}
+
 pub fn beep() {
     #[link(name = "AppKit", kind = "framework")]
     extern "C" {

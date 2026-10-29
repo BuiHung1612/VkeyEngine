@@ -150,6 +150,11 @@ impl Macros {
         Some(content)
     }
 
+    /// Name (text) of the macro whose key is `key`, as `find` left it.
+    pub fn text_of(&self, key: &[u32]) -> Option<&str> {
+        self.map.get(key).map(|m| m.text.as_str())
+    }
+
     pub fn has(&self, name: &str, code_table: u8) -> bool {
         self.map.contains_key(&convert(name, code_table))
     }

@@ -47,6 +47,8 @@ const T_MACROS: isize = 33;
 const T_ABOUT: isize = 34;
 const T_QUIT: isize = 35;
 const T_CHECK_UPDATE: isize = 37;
+const T_EXCLUDE: isize = 38;
+const T_EXCLUDE_CLEAR: isize = 39;
 const T_PAGE: isize = 40; // + page
 const T_TOGGLE: isize = 100; // + index in TOGGLES
 const T_POPUP: isize = 200; // + index in POPUPS
@@ -716,6 +718,7 @@ pub fn run_app() {
         hook::start();
         SetTimer(main, TIMER_HOOK, 2000, None);
         start_update_checks();
+        crate::stats::load_typing(&reg::data("TypingStats"), super::today());
         reg::set_run_on_startup(reg::flag("vRunWithWindows", true));
         if reg::flag("vShowOnStartUp", true) {
             show(Kind::Settings);
@@ -787,9 +790,16 @@ fn copy_wide(dst: &mut [u16], s: &str) {
     }
 }
 
+/// Foreground app (file name without .exe), and whether it is excluded.
+fn front_app() -> (String, bool) {
+    with_app(|a| (a.front_app.trim_end_matches(".exe").trim_end_matches(".EXE").to_string(), a.front_excluded())).unwrap_or_default()
+}
+
 fn tray(message: NOTIFY_ICON_MESSAGE) {
     let (s, _) = read_settings();
-    let vietnamese = s.language == 1;
+    let (front, excluded) = front_app();
+    // "E" while typing goes untouched (English, or an excluded app)
+    let vietnamese = s.language == 1 && !excluded;
     unsafe {
         let size = GetSystemMetricsForDpi(SM_CXSMICON, GetDpiForWindow(main_hwnd()).max(96));
         let icon = if message == NIM_DELETE { null_mut() } else { tray_icon(vietnamese, size) };
@@ -805,6 +815,8 @@ fn tray(message: NOTIFY_ICON_MESSAGE) {
         let mode = if vietnamese { "Tiếng Việt" } else { "Tiếng Anh" };
         let tip = if hook::FRONT_ELEVATED.load(Ordering::SeqCst) {
             "VKeyEngine · ⚠ Ứng dụng này chạy quyền Admin: chạy VKeyEngine bằng quyền Admin để gõ được".to_string()
+        } else if excluded {
+            format!("VKeyEngine · Đang tắt trong {front}")
         } else {
             format!("VKeyEngine · {mode} · {}", INPUT_TYPES[s.input_type as usize])
         };
@@ -833,6 +845,11 @@ fn tray_menu() {
         let current = if s.language == 1 { T_VIETNAMESE } else { T_ENGLISH };
         CheckMenuRadioItem(menu, T_ENGLISH as u32, T_VIETNAMESE as u32, current as u32, MF_BYCOMMAND);
         SetMenuDefaultItem(menu, current as u32, 0); // bold
+        AppendMenuW(menu, MF_SEPARATOR, 0, null());
+        let (front, excluded) = front_app();
+        let flags = if front.is_empty() { MF_GRAYED } else if excluded { MF_CHECKED } else { 0 };
+        let app = if front.is_empty() { "ứng dụng này".to_string() } else { front };
+        add(menu, T_EXCLUDE, &format!("Không gõ tiếng Việt trong {app}"), flags);
         AppendMenuW(menu, MF_SEPARATOR, 0, null());
 
         let sub = |items: &[&str], base: isize, selected: usize| {
@@ -907,6 +924,13 @@ unsafe extern "system" fn main_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam
             hook::check_alive();
             let (cpu, memory) = super::process_usage();
             crate::stats::sample(cpu, memory);
+            crate::stats::set_day(super::today());
+            thread_local! {
+                static TICKS: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+            }
+            if TICKS.with(|t| t.replace(t.get() + 1)).is_multiple_of(30) {
+                save_typing_stats(); // once a minute, only if something changed
+            }
             for hwnd in all_windows() {
                 if with_win(hwnd, |w| w.kind == Kind::Settings && w.page == ACTIVITY_PAGE) == Some(true) {
                     InvalidateRect(hwnd, null(), 0);
@@ -919,6 +943,7 @@ unsafe extern "system" fn main_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam
             0
         }
         WM_DESTROY => {
+            save_typing_stats();
             tray(NIM_DELETE);
             PostQuitMessage(0);
             0
@@ -995,6 +1020,17 @@ fn action(hwnd: HWND, tag: isize) {
         T_SETTINGS => show(Kind::Settings),
         T_MACROS => show(Kind::Macros),
         T_ABOUT => show(Kind::About),
+        T_EXCLUDE => {
+            with_app(|a| a.toggle_front_excluded());
+            refresh();
+        }
+        T_EXCLUDE_CLEAR => {
+            with_app(|a| {
+                a.excluded.clear();
+                a.save_excluded();
+            });
+            refresh();
+        }
         T_CHECK_UPDATE => {
             std::thread::spawn(|| check_update(true));
         }
@@ -1212,16 +1248,18 @@ fn build(kind: Kind, page: usize) -> Page {
                     p.buttons(&[], &[("Bảng gõ tắt…", T_MACROS)], 0);
                 }
                 ACTIVITY_PAGE => {
+                    p.section("Hôm nay");
+                    p.card((0..4).map(|n| (ACTIVITY_ROWS[n], Ctl::Stat(n))).collect());
                     p.section("CPU · 2 phút gần nhất");
                     let r = R { x: PAD, y: p.y, w: p.w - 2.0 * PAD, h: 96.0 };
                     p.items.push(Item::Card(r));
                     p.items.push(Item::Graph(R { x: r.x + INSET, y: r.y + 8.0, w: r.w - 2.0 * INSET, h: r.h - 16.0 }));
                     p.y += r.h;
                     p.section("Tài nguyên");
-                    p.card((0..3).map(|n| (ACTIVITY_ROWS[n], Ctl::Stat(n))).collect());
+                    p.card((4..7).map(|n| (ACTIVITY_ROWS[n], Ctl::Stat(n))).collect());
                     p.section("Bộ gõ");
-                    p.card((3..7).map(|n| (ACTIVITY_ROWS[n], Ctl::Stat(n))).collect());
-                    p.note("Cập nhật mỗi 2 giây. Khi để không, VKeyEngine gần như không dùng CPU.");
+                    p.card((7..11).map(|n| (ACTIVITY_ROWS[n], Ctl::Stat(n))).collect());
+                    p.note("Thống kê chỉ đếm số lượng, không lưu nội dung bạn gõ.");
                 }
                 _ => {
                     p.section("Chính tả");
@@ -1237,7 +1275,10 @@ fn build(kind: Kind, page: usize) -> Page {
                     p.card(rows);
                     p.section("Tương thích");
                     p.toggle_card(P_COMPAT);
-                    p.buttons(&[("Khôi phục mặc định", T_DEFAULTS)], &[], 0);
+                    p.section("Ứng dụng loại trừ");
+                    p.card(vec![("Không gõ tiếng Việt trong", Ctl::Stat(STAT_EXCLUDED))]);
+                    p.note("Đang ở ứng dụng cần loại trừ, chọn \"Không gõ tiếng Việt trong …\" ở icon khay hệ thống.");
+                    p.buttons(&[("Khôi phục mặc định", T_DEFAULTS)], &[("Bỏ loại trừ tất cả", T_EXCLUDE_CLEAR)], 0);
                 }
             }
         }
@@ -1303,7 +1344,14 @@ fn build(kind: Kind, page: usize) -> Page {
 const ACTIVITY_PAGE: usize = 3;
 /// Settings pages taller than this scroll, so the window fits a 13" screen.
 const MAX_PAGE_H: f32 = 540.0;
-const ACTIVITY_ROWS: [&str; 7] = [
+/// `Item::Stat` index of the excluded apps line (the others index ACTIVITY_ROWS).
+const STAT_EXCLUDED: usize = 100;
+
+const ACTIVITY_ROWS: [&str; 11] = [
+    "Số từ đã gõ",
+    "Tốc độ (từ / phút)",
+    "Nhanh nhất hôm nay",
+    "Gõ tắt dùng nhiều nhất",
     "Bộ nhớ (RAM)",
     "CPU hiện tại",
     "Thời gian chạy",
@@ -1313,17 +1361,25 @@ const ACTIVITY_ROWS: [&str; 7] = [
     "Chậm nhất",
 ];
 
-fn activity_texts() -> [String; 7] {
+fn activity_texts() -> [String; 11] {
     use crate::stats;
     let s = stats::snapshot();
+    let t = stats::typing_snapshot();
+    let (front, excluded) = front_app();
     let status = if hook::FRONT_ELEVATED.load(Ordering::SeqCst) {
         "⚠ Ứng dụng quyền Admin đang mở".to_string()
+    } else if excluded {
+        format!("Đang tắt trong {front}")
     } else if read_settings().0.language == 1 {
         "Đang hoạt động · Tiếng Việt".to_string()
     } else {
         "Đang hoạt động · Tiếng Anh".to_string()
     };
     [
+        stats::thousands(t.words),
+        t.wpm.to_string(),
+        format!("{} từ / phút", t.best_wpm),
+        stats::top_macros(&t.top_macros),
         stats::memory(s.memory),
         stats::percent(s.cpu),
         stats::duration(s.uptime),
@@ -1723,7 +1779,7 @@ fn paint(hwnd: HWND) {
             let mut w: Vec<u16> = text.encode_utf16().collect();
             DrawTextW(mem, w.as_mut_ptr(), w.len() as i32, &mut rect, DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS | DT_NOPREFIX | align);
         };
-        let mut activity: Option<[String; 7]> = None; // computed once per paint
+        let mut activity: Option<[String; 11]> = None; // computed once per paint
         for item in &items {
             match item {
                 Item::Text { r, s: text, size, bold, secondary, center, toggle } => {
@@ -1755,6 +1811,11 @@ fn paint(hwnd: HWND) {
                         let color = if n == page { t.on_accent } else { t.text };
                         draw(seg, label, 13.0, n == page, color, DT_CENTER);
                     }
+                }
+                Item::Stat { r, n } if *n == STAT_EXCLUDED => {
+                    let names = with_app(|a| a.excluded.iter().map(|e| e.trim_end_matches(".exe").to_string()).collect::<Vec<_>>().join(", "))
+                        .unwrap_or_default();
+                    draw(*r, if names.is_empty() { "Chưa có" } else { &names }, 13.0, false, t.secondary, DT_RIGHT);
                 }
                 Item::Stat { r, n } => {
                     let texts = activity.get_or_insert_with(activity_texts);
@@ -2196,6 +2257,12 @@ fn handle_update_event() {
             alert(null_mut(), &format!("Không cài được bản mới.\n{e}\nTrang tải về sẽ được mở để bạn cài thủ công."));
             open_releases_page();
         }
+    }
+}
+
+fn save_typing_stats() {
+    if let Some(bytes) = crate::stats::take_saved_typing() {
+        reg::set_data("TypingStats", &bytes);
     }
 }
 

@@ -390,6 +390,17 @@ fn handle(app: &mut App, proxy: CGEventTapProxy, ty: CGEventType, ev: &CGEvent) 
         }
     }
 
+    // statistics: counts only (a character never leaves this function)
+    if ty == CGEventType::KeyDown && !other_control_key(app.tap.flag) {
+        if let Some(c) = ch {
+            crate::stats::record_char(c);
+        }
+    }
+    // excluded app (Terminal, IDE...): stay out of the way, but hot keys above still work
+    if app.front_excluded() {
+        return Outcome::Pass;
+    }
+
     let is_mouse = [
         CGEventType::LeftMouseDown,
         CGEventType::RightMouseDown,
@@ -558,6 +569,9 @@ fn send_new_chars(app: &mut App, typed: Option<u16>) {
 }
 
 fn handle_macro(app: &mut App, shift: bool) {
+    if let Some(name) = app.engine.last_macro.take() {
+        crate::stats::record_macro(&name);
+    }
     let table = app.engine.s.code_table;
     let double = is_double_code(table);
     let compound_app = Tap::uses_compound_workaround(app);

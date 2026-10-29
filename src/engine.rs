@@ -221,6 +221,8 @@ pub struct Engine {
     pub s: Settings,
     pub hook: HookState,
     pub macros: Macros,
+    /// name of the last macro replaced (for usage statistics)
+    pub last_macro: Option<String>,
 
     typing_word: [u32; MAX_BUFF],
     index: i32,
@@ -264,6 +266,7 @@ impl Engine {
             s,
             hook: HookState::default(),
             macros: Macros::default(),
+            last_macro: None,
             typing_word: [0; MAX_BUFF],
             index: 0,
             long_word_helper: Vec::new(),
@@ -1448,6 +1451,7 @@ impl Engine {
         match self.macros.find(&mut self.hook.macro_key, table, auto_caps) {
             Some(data) => {
                 self.hook.macro_data = data;
+                self.last_macro = self.macros.text_of(&self.hook.macro_key).map(str::to_string);
                 true
             }
             None => false,

@@ -208,13 +208,12 @@ unsafe extern "system" fn foreground_changed(
     _time: u32,
 ) {
     let Some((exe, elevated)) = foreground_app() else { return };
-    if FRONT_ELEVATED.swap(elevated, Ordering::SeqCst) != elevated {
-        ui::post_refresh(); // tray tooltip explains why typing does not work there
-    }
+    FRONT_ELEVATED.store(elevated, Ordering::SeqCst);
     if exe.eq_ignore_ascii_case("explorer.exe") {
         return;
     }
     guarded(|a| a.on_active_app_changed(exe));
+    ui::post_refresh(); // tray icon and menu follow the app (excluded, elevated)
 }
 
 /// Process token is elevated (an unreadable token counts as elevated).
@@ -405,6 +404,19 @@ fn handle_key(app: &mut App, msg: u32, vk: u16) -> bool {
     let caps_status = if shift && caps_lock { 0 } else if shift { 1 } else if caps_lock { 2 } else { 0 };
     let other_control_key = flag & (CONTROL | ALT) != 0;
 
+    // statistics: counts only (a character never leaves this function)
+    if down && !other_control_key {
+        let c = match vk {
+            VK_RETURN | VK_TAB => '\n',
+            _ => char::from_u32(key_to_char(ek as u32 | if caps { CAPS_MASK } else { 0 }) as u32).unwrap_or('\0'),
+        };
+        crate::stats::record_char(c);
+    }
+    // excluded app (terminal, IDE...): stay out of the way, but hot keys above still work
+    if app.front_excluded() {
+        return false;
+    }
+
     if app.engine.s.language == 0 {
         if app.engine.s.use_macro && app.engine.s.use_macro_in_english && down {
             app.engine.english_mode(KeyState::KeyDown, ek, caps, other_control_key);
@@ -588,6 +600,9 @@ fn send_new_chars(app: &mut App, typed: Option<u16>, vk: u16) {
 }
 
 fn handle_macro(app: &mut App, ek: u16, shift: bool) {
+    if let Some(name) = app.engine.last_macro.take() {
+        crate::stats::record_macro(&name);
+    }
     let table = app.engine.s.code_table;
     let double = is_double_code(table);
     let mut bs = app.engine.hook.backspace_count;
