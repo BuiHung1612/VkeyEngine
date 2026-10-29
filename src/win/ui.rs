@@ -548,6 +548,8 @@ struct Win {
     focus: Option<usize>,
     /// hot key being recorded (T_RECORD_*)
     recording: Option<isize>,
+    /// modifiers held so far while recording (a modifier-only hot key is saved on release)
+    rec_mods: i64,
 }
 
 thread_local! {
@@ -1080,7 +1082,10 @@ fn action(hwnd: HWND, tag: isize) {
         },
         T_DEFAULTS => reset_defaults(hwnd),
         T_RECORD_SWITCH | T_RECORD_CONVERT => {
-            with_win(hwnd, |w| w.recording = Some(tag));
+            with_win(hwnd, |w| {
+                w.recording = Some(tag);
+                w.rec_mods = 0;
+            });
             unsafe {
                 SetFocus(hwnd);
                 InvalidateRect(hwnd, null(), 0);
@@ -1138,11 +1143,43 @@ fn reset_defaults(hwnd: HWND) {
     reload();
 }
 
-fn record_key(hwnd: HWND, tag: isize, vk: u16) {
+fn held_mods() -> i64 {
+    let down = |vk: u16| unsafe { GetKeyState(vk as i32) } < 0;
+    [(VK_CONTROL, hotkey::CONTROL), (VK_MENU, hotkey::ALT), (VK_LWIN, hotkey::WIN), (VK_RWIN, hotkey::WIN), (VK_SHIFT, hotkey::SHIFT)]
+        .iter()
+        .filter(|&&(vk, _)| down(vk))
+        .fold(0, |m, &(_, bit)| m | bit)
+}
+
+fn hotkey_pref(tag: isize) -> (&'static str, i64) {
+    if tag == T_RECORD_SWITCH { ("vSwitchKeyStatus", DEFAULT_SWITCH_KEY) } else { ("convertToolHotKey", EMPTY_HOTKEY) }
+}
+
+fn save_hotkey(tag: isize, mods: i64, k: i64, c: i64) {
+    let (key, default) = hotkey_pref(tag);
+    let v = int_pref(key, default);
+    reg::set_int(key, (v & hotkey::BEEP) | mods | k | (c << 24));
+}
+
+/// Records the whole combination: modifiers held + key, or modifiers alone (e.g. Ctrl + Shift)
+/// when they are released without a key.
+fn record_key(hwnd: HWND, tag: isize, vk: u16, up: bool) {
     if modifier_key(vk) {
-        return; // wait for the key itself
+        let peak = with_win(hwnd, |w| {
+            w.rec_mods |= held_mods();
+            w.rec_mods
+        })
+        .unwrap_or(0);
+        if up && peak != 0 {
+            save_hotkey(tag, peak, hotkey::NO_KEY, hotkey::NO_KEY);
+            with_win(hwnd, |w| w.recording = None);
+            reload();
+        }
+        return;
     }
-    let (key, default) = if tag == T_RECORD_SWITCH { ("vSwitchKeyStatus", DEFAULT_SWITCH_KEY) } else { ("convertToolHotKey", EMPTY_HOTKEY) };
+    if up {
+        return;
+    }
     let (k, c): (i64, i64) = match vk {
         VK_ESCAPE => (-1, -1),
         VK_BACK | VK_DELETE => (hotkey::NO_KEY, hotkey::NO_KEY),
@@ -1153,8 +1190,12 @@ fn record_key(hwnd: HWND, tag: isize, vk: u16) {
         }
     };
     if k >= 0 {
-        let v = int_pref(key, default);
-        reg::set_int(key, (v & 0x00FF_FF00) | k | (c << 24));
+        let (key, default) = hotkey_pref(tag);
+        let mods = match held_mods() {
+            0 => int_pref(key, default) & (hotkey::CONTROL | hotkey::ALT | hotkey::WIN | hotkey::SHIFT),
+            m => m,
+        };
+        save_hotkey(tag, mods, k, c);
     }
     with_win(hwnd, |w| w.recording = None);
     reload();
@@ -1664,6 +1705,7 @@ fn show(kind: Kind) {
             hover: None,
             focus: None,
             recording: None,
+            rec_mods: 0,
         })
     });
     style_window(hwnd);
@@ -1766,7 +1808,7 @@ fn style_window(hwnd: HWND) {
     unsafe {
         let dark: BOOL = t.dark as BOOL;
         DwmSetWindowAttribute(hwnd, 20, &dark as *const BOOL as _, 4); // DWMWA_USE_IMMERSIVE_DARK_MODE
-        for (attr, c) in [(34, t.bg), (35, t.bg), (36, t.text)] {
+        for (attr, c) in [(34, t.border), (35, t.bg), (36, t.text)] {
             // DWMWA_BORDER_COLOR, DWMWA_CAPTION_COLOR, DWMWA_TEXT_COLOR
             let c = colorref(c);
             DwmSetWindowAttribute(hwnd, attr, &c as *const u32 as _, 4);
@@ -2022,7 +2064,7 @@ fn paint(hwnd: HWND) {
                 Item::Record { r, tag } => {
                     let key = if *tag == T_RECORD_SWITCH { "vSwitchKeyStatus" } else { "convertToolHotKey" };
                     let default = if *tag == T_RECORD_SWITCH { DEFAULT_SWITCH_KEY } else { EMPTY_HOTKEY };
-                    let label = if recording == Some(*tag) { "Nhấn một phím…".to_string() } else { hotkey::key_title(int_pref(key, default)) };
+                    let label = if recording == Some(*tag) { "Bấm tổ hợp phím…".to_string() } else { hotkey::key_title(int_pref(key, default)) };
                     draw(*r, &label, 12.0, false, t.text, DT_CENTER);
                 }
                 Item::Segment { r, labels, .. } => {
@@ -2181,10 +2223,16 @@ unsafe extern "system" fn win_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
             }
             0
         }
+        WM_KEYUP | WM_SYSKEYUP if matches!(with_win(hwnd, |w| w.recording), Some(Some(_))) => {
+            if let Some(Some(tag)) = with_win(hwnd, |w| w.recording) {
+                record_key(hwnd, tag, wparam as u16, true);
+            }
+            0
+        }
         WM_KEYDOWN | WM_SYSKEYDOWN => {
             let vk = wparam as u16;
             if let Some(Some(tag)) = with_win(hwnd, |w| w.recording) {
-                record_key(hwnd, tag, vk);
+                record_key(hwnd, tag, vk, false);
                 return 0;
             }
             match vk {
