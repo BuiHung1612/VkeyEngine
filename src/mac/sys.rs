@@ -76,25 +76,59 @@ fn status(service: *mut AnyObject) -> isize {
     unsafe { msg_send![service, status] }
 }
 
-/// Start at login through the launch agent, which also restarts the app if it is killed
-/// (memory pressure) or crashes, but not after Quit (a successful exit).
-pub fn set_launch_agent(on: bool) {
+/// Start at login. Through the launch agent when possible: it also restarts the app if it
+/// is killed (memory pressure) or crashes, but not after Quit (a successful exit). An ad-hoc
+/// signed build gets the plain login item instead (no restart).
+pub fn set_run_at_login(on: bool) {
+    let agent = can_use_launch_agent();
+    set_registered(service(true), on && agent);
+    set_registered(service(false), on && !agent);
+}
+
+fn set_registered(service: *mut AnyObject, on: bool) {
+    if service.is_null() {
+        return;
+    }
+    let registered = matches!(status(service), 1 | 2); // enabled, or waiting for approval
+    if on == registered {
+        return;
+    }
+    let mut err: *mut AnyObject = std::ptr::null_mut();
     unsafe {
-        let mut err: *mut AnyObject = std::ptr::null_mut();
-        // earlier builds used the plain login item, which does not restart the app
-        let legacy = service(false);
-        if !legacy.is_null() && status(legacy) == 1 {
-            let _: bool = msg_send![legacy, unregisterAndReturnError: &mut err];
-        }
-        let agent = service(true);
-        if agent.is_null() || on == launch_agent_enabled() {
-            return;
-        }
         let _: bool = if on {
-            msg_send![agent, registerAndReturnError: &mut err]
+            msg_send![service, registerAndReturnError: &mut err]
         } else {
-            msg_send![agent, unregisterAndReturnError: &mut err]
+            msg_send![service, unregisterAndReturnError: &mut err]
         };
+    }
+}
+
+/// launchd refuses to start an ad-hoc signed app as an agent ("Launch Constraint
+/// Violation"), so only a build signed with a real certificate can use it.
+pub fn can_use_launch_agent() -> bool {
+    #[link(name = "Security", kind = "framework")]
+    extern "C" {
+        fn SecCodeCopySelf(flags: u32, code: *mut *const c_void) -> i32;
+        fn SecCodeCopyStaticCode(code: *const c_void, flags: u32, static_code: *mut *const c_void) -> i32;
+        fn SecCodeCopySigningInformation(code: *const c_void, flags: u32, info: *mut *const c_void) -> i32;
+    }
+    const SIGNING_INFORMATION: u32 = 1 << 1; // kSecCSSigningInformation
+    const AD_HOC: u32 = 0x0002; // kSecCodeSignatureAdhoc
+    unsafe {
+        let (mut code, mut stat, mut info) = (std::ptr::null(), std::ptr::null(), std::ptr::null());
+        let mut flags = None;
+        if SecCodeCopySelf(0, &mut code) == 0 {
+            if SecCodeCopyStaticCode(code, 0, &mut stat) == 0 {
+                if SecCodeCopySigningInformation(stat, SIGNING_INFORMATION, &mut info) == 0 && !info.is_null() {
+                    let dict = &*(info as *const NSDictionary<NSString, AnyObject>);
+                    flags = dict.objectForKey(&NSString::from_str("flags")).and_then(|f| f.downcast::<NSNumber>().ok()).map(|n| n.unsignedIntValue());
+                    CFRelease(info);
+                }
+                CFRelease(stat);
+            }
+            CFRelease(code);
+        }
+        flags.is_some_and(|f| f & AD_HOC == 0)
     }
 }
 

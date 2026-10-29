@@ -310,7 +310,7 @@ define_class!(
         fn will_terminate(&self, _n: &NSNotification) {
             // turned off while running as the agent: unregistering earlier would have killed us
             if !prefs::flag("RunOnStartup", true) {
-                sys::set_launch_agent(false);
+                sys::set_run_at_login(false);
             }
         }
 
@@ -456,14 +456,23 @@ pub fn acquire_single_instance_lock() -> bool {
     })
 }
 
-fn try_lock() -> bool {
-    let Some(home) = std::env::var_os("HOME") else { return true };
+/// Another copy holds the lock within 3 s (the launch agent copy we just started).
+pub fn wait_for_other_instance() -> bool {
+    (0..30).any(|_| {
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        lock_file().is_some_and(|f| f.try_lock().is_err()) // dropping `f` releases a lock we got
+    })
+}
+
+fn lock_file() -> Option<std::fs::File> {
+    let home = std::env::var_os("HOME")?;
     let dir = std::path::Path::new(&home).join("Library/Application Support/VKeyEngine");
     let _ = std::fs::create_dir_all(&dir);
-    let Ok(file) = std::fs::OpenOptions::new().create(true).truncate(false).write(true).open(dir.join("vkeyengine.lock"))
-    else {
-        return true;
-    };
+    std::fs::OpenOptions::new().create(true).truncate(false).write(true).open(dir.join("vkeyengine.lock")).ok()
+}
+
+fn try_lock() -> bool {
+    let Some(file) = lock_file() else { return true };
     if file.try_lock().is_err() {
         return false;
     }
@@ -488,13 +497,10 @@ fn did_finish_launching() {
     with_app(|a| {
         a.on_active_app_changed();
     });
-    if prefs::flag("RunOnStartup", true) {
-        sys::set_launch_agent(true);
-        // Started by hand: let launchd run the app instead, so it is restarted if killed.
-        if !sys::under_launch_agent() && sys::launch_agent_enabled() && sys::start_launch_agent() {
-            NSApplication::sharedApplication(mtm()).terminate(None);
-            return;
-        }
+    let at_login = prefs::flag("RunOnStartup", true);
+    // turning it off while running as the agent waits for Quit (see applicationWillTerminate)
+    if at_login || !sys::under_launch_agent() {
+        sys::set_run_at_login(at_login);
     }
     start_watchdog();
     if !start_tap() {
@@ -848,7 +854,7 @@ fn action(tag: isize, sender: &AnyObject) {
             }
             match tg.key {
                 // turning it off while running as the agent waits for Quit (see applicationWillTerminate)
-                "RunOnStartup" if on || !sys::under_launch_agent() => sys::set_launch_agent(on),
+                "RunOnStartup" if on || !sys::under_launch_agent() => sys::set_run_at_login(on),
                 "vShowIconOnDock" => set_dock_icon(on),
                 _ => {}
             }
@@ -885,7 +891,7 @@ fn reset_defaults() {
         }
     }
     set_popup_value(POP_CASE, 0);
-    sys::set_launch_agent(true);
+    sys::set_run_at_login(true);
     set_dock_icon(false);
     reload();
 }

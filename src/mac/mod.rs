@@ -265,6 +265,16 @@ impl App {
 
 /// Run the app (never returns).
 pub fn run() {
+    // Started by hand while the launch agent is set up: let launchd run the app instead, so
+    // it is restarted if killed. Only once the agent copy really runs; otherwise carry on.
+    let hand_over = !sys::under_launch_agent()
+        && prefs::flag("RunOnStartup", true)
+        && sys::can_use_launch_agent()
+        && sys::launch_agent_enabled()
+        && sys::start_launch_agent();
+    if hand_over && ui::wait_for_other_instance() {
+        return;
+    }
     if !ui::acquire_single_instance_lock() {
         return;
     }
