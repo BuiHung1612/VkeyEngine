@@ -1,0 +1,61 @@
+#!/bin/sh
+# Build VKeyEngine.app from the Rust sources.
+# Usage: ./build-macos.sh [--debug | --universal]   (output: target/VKeyEngine.app)
+set -eu
+cd "$(dirname "$0")"
+APP=target/VKeyEngine.app
+VERSION=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
+BUILD=1
+
+if [ "${1:-}" = "--debug" ]; then
+    cargo build
+    BIN=target/debug/VKeyEngine
+elif [ "${1:-}" = "--universal" ]; then
+    cargo build --release --target aarch64-apple-darwin
+    cargo build --release --target x86_64-apple-darwin
+    BIN=target/VKeyEngine-universal
+    lipo -create -output "$BIN" target/aarch64-apple-darwin/release/VKeyEngine target/x86_64-apple-darwin/release/VKeyEngine
+else
+    cargo build --release
+    BIN=target/release/VKeyEngine
+fi
+
+rm -rf "$APP"
+mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
+cp "$BIN" "$APP/Contents/MacOS/VKeyEngine"
+cp macos/Status*.png macos/Icon.icns "$APP/Contents/Resources/"
+# black / white accent color (needs Xcode's actool; without it controls use the system accent)
+if xcrun --find actool >/dev/null 2>&1; then
+    xcrun actool macos/Assets.xcassets --compile "$APP/Contents/Resources" --platform macosx \
+        --minimum-deployment-target 11.0 --output-partial-info-plist target/assets-info.plist >/dev/null
+fi
+cat > "$APP/Contents/Info.plist" <<PLIST
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>CFBundleDevelopmentRegion</key><string>vi</string>
+	<key>CFBundleDisplayName</key><string>VKeyEngine</string>
+	<key>CFBundleExecutable</key><string>VKeyEngine</string>
+	<key>CFBundleIconFile</key><string>Icon</string>
+	<key>CFBundleIdentifier</key><string>com.vkeyengine.app</string>
+	<key>CFBundleInfoDictionaryVersion</key><string>6.0</string>
+	<key>CFBundleName</key><string>VKeyEngine</string>
+	<key>CFBundlePackageType</key><string>APPL</string>
+	<key>CFBundleShortVersionString</key><string>$VERSION</string>
+	<key>CFBundleVersion</key><string>$BUILD</string>
+	<key>LSApplicationCategoryType</key><string>public.app-category.utilities</string>
+	<key>LSMinimumSystemVersion</key><string>11.0</string>
+	<key>LSUIElement</key><true/>
+	<key>NSAccentColorName</key><string>AccentColor</string>
+	<key>NSHumanReadableCopyright</key><string>VKeyEngine, GPL v3. Based on OpenKey © 2019 Mai Vu Tuyen.</string>
+	<key>NSPrincipalClass</key><string>NSApplication</string>
+</dict>
+</plist>
+PLIST
+# A real certificate keeps the Accessibility permission across rebuilds (an ad-hoc signature
+# changes every build, so macOS forgets the grant). Falls back to ad-hoc if it is missing.
+SIGN_ID=${SIGN_ID:-"Apple Development: hungbt20@gmail.com (TMJH9RR69S)"}
+security find-identity -v -p codesigning | grep -qF "$SIGN_ID" || SIGN_ID=-
+codesign --force --deep --sign "$SIGN_ID" "$APP"
+echo "Built $APP ($VERSION)"
