@@ -46,7 +46,9 @@ jobs:
           security set-keychain-settings "$KC"
           security unlock-keychain -p ci "$KC"
           echo "$MACOS_CERT_P12" | base64 --decode > "$RUNNER_TEMP/cert.p12"
-          security import "$RUNNER_TEMP/cert.p12" -k "$KC" -P "$MACOS_CERT_PASSWORD" -T /usr/bin/codesign
+          # a password pasted into the secret often ends with a newline
+          PASS=$(printf %s "$MACOS_CERT_PASSWORD" | tr -d '\r\n ')
+          security import "$RUNNER_TEMP/cert.p12" -k "$KC" -P "$PASS" -T /usr/bin/codesign
           security set-key-partition-list -S apple-tool:,apple: -s -k ci "$KC" > /dev/null
           security list-keychains -d user -s "$KC" $(security list-keychains -d user | tr -d '"')
           rm "$RUNNER_TEMP/cert.p12"
