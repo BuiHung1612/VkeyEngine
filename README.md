@@ -8,6 +8,8 @@ Bộ gõ tiếng Việt cho macOS và Windows, viết bằng Rust. Một engine 
 - Gõ tắt (nhập / xuất định dạng UniKey), tự viết hoa theo từ gõ tắt
 - Tự nhớ chế độ gõ và bảng mã theo từng ứng dụng
 - Công cụ chuyển mã clipboard (văn bản và HTML), có phím tắt
+- Tự kiểm tra và cài bản mới từ GitHub Releases (có thể tắt)
+- Trang "Hoạt động": RAM, CPU, thời gian xử lý mỗi phím
 
 ## Build
 
@@ -19,7 +21,16 @@ cargo build --release        # Windows -> target\release\VKeyEngine.exe
 
 macOS cần quyền Trợ năng (Accessibility). `build-macos.sh` ký bằng chứng chỉ Apple Development nếu có (đặt `SIGN_ID` để chọn chứng chỉ khác), để quyền không mất sau mỗi lần build; không có chứng chỉ thì ký ad-hoc. Màu nhấn đen trắng cần `actool` của Xcode.
 
-CI (`.github/workflows/vkeyengine.yml`) chạy test và build cả hai bản trên GitHub Actions, kèm file tải về.
+### Ký bản macOS
+
+Bản phát hành được ký bằng một chứng chỉ tự ký cố định ("VKeyEngine Code Signing"), để macOS nhận ra vẫn là app cũ sau mỗi lần cập nhật và giữ quyền Trợ năng. CI đọc chứng chỉ từ hai secret của repo:
+
+- `MACOS_CERT_P12`: file `.p12` mã hoá base64
+- `MACOS_CERT_PASSWORD`: mật khẩu của file `.p12`
+
+Thiếu secret thì CI vẫn build (ký ad-hoc), riêng khi push tag thì báo lỗi. Đổi chứng chỉ sẽ làm người dùng phải cấp lại quyền một lần. Giữ kín khoá riêng: ai có nó ký được app mà macOS coi là VKeyEngine, kể cả quyền Trợ năng đã cấp.
+
+CI (`.github/workflows/vkeyengine.yml`) chạy test và build cả hai bản trên GitHub Actions. Push một tag `vX.Y.Z` (khớp `version` trong `Cargo.toml`) để CI tạo Release; app sẽ tìm thấy bản đó khi kiểm tra cập nhật.
 
 ## Cấu trúc
 

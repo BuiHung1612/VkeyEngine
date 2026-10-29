@@ -103,32 +103,27 @@ fn set_registered(service: *mut AnyObject, on: bool) {
     }
 }
 
-/// launchd refuses to start an ad-hoc signed app as an agent ("Launch Constraint
-/// Violation"), so only a build signed with a real certificate can use it.
+/// launchd refuses to start an agent that is not signed by an Apple issued certificate
+/// ("Launch Constraint Violation": ad-hoc and self-signed builds), so only those use it.
 pub fn can_use_launch_agent() -> bool {
     #[link(name = "Security", kind = "framework")]
     extern "C" {
         fn SecCodeCopySelf(flags: u32, code: *mut *const c_void) -> i32;
-        fn SecCodeCopyStaticCode(code: *const c_void, flags: u32, static_code: *mut *const c_void) -> i32;
-        fn SecCodeCopySigningInformation(code: *const c_void, flags: u32, info: *mut *const c_void) -> i32;
+        fn SecRequirementCreateWithString(text: *const c_void, flags: u32, requirement: *mut *const c_void) -> i32;
+        fn SecCodeCheckValidity(code: *const c_void, flags: u32, requirement: *const c_void) -> i32;
     }
-    const SIGNING_INFORMATION: u32 = 1 << 1; // kSecCSSigningInformation
-    const AD_HOC: u32 = 0x0002; // kSecCodeSignatureAdhoc
     unsafe {
-        let (mut code, mut stat, mut info) = (std::ptr::null(), std::ptr::null(), std::ptr::null());
-        let mut flags = None;
+        let (mut code, mut req) = (std::ptr::null(), std::ptr::null());
+        let text = NSString::from_str("anchor apple generic");
+        let mut ok = false;
         if SecCodeCopySelf(0, &mut code) == 0 {
-            if SecCodeCopyStaticCode(code, 0, &mut stat) == 0 {
-                if SecCodeCopySigningInformation(stat, SIGNING_INFORMATION, &mut info) == 0 && !info.is_null() {
-                    let dict = &*(info as *const NSDictionary<NSString, AnyObject>);
-                    flags = dict.objectForKey(&NSString::from_str("flags")).and_then(|f| f.downcast::<NSNumber>().ok()).map(|n| n.unsignedIntValue());
-                    CFRelease(info);
-                }
-                CFRelease(stat);
+            if SecRequirementCreateWithString(Retained::as_ptr(&text) as *const c_void, 0, &mut req) == 0 {
+                ok = SecCodeCheckValidity(code, 0, req) == 0;
+                CFRelease(req);
             }
             CFRelease(code);
         }
-        flags.is_some_and(|f| f & AD_HOC == 0)
+        ok
     }
 }
 

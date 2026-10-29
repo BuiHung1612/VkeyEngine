@@ -46,6 +46,7 @@ const T_SETTINGS: isize = 32;
 const T_MACROS: isize = 33;
 const T_ABOUT: isize = 34;
 const T_QUIT: isize = 35;
+const T_CHECK_UPDATE: isize = 37;
 const T_PAGE: isize = 40; // + page
 const T_TOGGLE: isize = 100; // + index in TOGGLES
 const T_POPUP: isize = 200; // + index in POPUPS
@@ -67,6 +68,7 @@ const WM_TRAY: u32 = WM_APP + 10;
 const WM_REFRESH: u32 = WM_APP + 11;
 const WM_QUICK_CONVERT: u32 = WM_APP + 12;
 const WM_SHOW_SETTINGS: u32 = WM_APP + 13;
+const WM_UPDATE: u32 = WM_APP + 14;
 const TIMER_HOOK: usize = 1;
 
 const INPUT_TYPES: [&str; 4] = ["Telex", "VNI", "Simple Telex 1", "Simple Telex 2"];
@@ -115,6 +117,7 @@ static TOGGLES: &[Toggle] = &[
     t("vAutoCapsMacro", false, "Tự viết hoa theo từ gõ tắt (btw → Btw → BTW)", P_MACRO),
     t("vRunWithWindows", true, "Khởi động cùng Windows", P_STARTUP),
     t("vShowOnStartUp", true, "Hiện bảng điều khiển khi khởi động", P_STARTUP),
+    t("vAutoCheckUpdate", true, "Tự kiểm tra bản mới", P_STARTUP),
     t("vUseSmartSwitchKey", true, "Tự nhớ chế độ gõ Việt / Anh theo từng ứng dụng", P_SMART),
     t("vRememberCode", true, "Tự nhớ bảng mã theo từng ứng dụng", P_SMART),
     t("vTempOffOpenKey", false, "Tạm tắt VKeyEngine bằng phím Alt", P_SMART),
@@ -704,6 +707,7 @@ pub fn run_app() {
         tray(NIM_ADD);
         hook::start();
         SetTimer(main, TIMER_HOOK, 2000, None);
+        start_update_checks();
         reg::set_run_on_startup(reg::flag("vRunWithWindows", true));
         if reg::flag("vShowOnStartUp", true) {
             show(Kind::Settings);
@@ -843,6 +847,7 @@ fn tray_menu() {
         AppendMenuW(menu, MF_SEPARATOR, 0, null());
         add(menu, T_SETTINGS, "Bảng điều khiển…", 0);
         add(menu, T_MACROS, "Gõ tắt…", 0);
+        add(menu, T_CHECK_UPDATE, "Kiểm tra bản mới…", 0);
         add(menu, T_ABOUT, "Giới thiệu", 0);
         AppendMenuW(menu, MF_SEPARATOR, 0, null());
         add(menu, T_QUIT, "Thoát VKeyEngine", 0);
@@ -880,6 +885,10 @@ unsafe extern "system" fn main_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam
         }
         WM_SHOW_SETTINGS => {
             show(Kind::Settings);
+            0
+        }
+        WM_UPDATE => {
+            handle_update_event();
             0
         }
         WM_INPUT => {
@@ -978,6 +987,9 @@ fn action(hwnd: HWND, tag: isize) {
         T_SETTINGS => show(Kind::Settings),
         T_MACROS => show(Kind::Macros),
         T_ABOUT => show(Kind::About),
+        T_CHECK_UPDATE => {
+            std::thread::spawn(|| check_update(true));
+        }
         T_QUIT => unsafe {
             DestroyWindow(main_hwnd());
         },
@@ -2030,3 +2042,116 @@ mod tests {
         assert!(out[num("EndFragment:")..].starts_with("<!--EndFragment-->"));
     }
 }
+
+// ---------------------------------------------------------------- updates
+
+const UPDATE_ASSET: &str = "VKeyEngine-windows-x64.exe";
+
+enum UpdateEvent {
+    Checked { manual: bool, result: Result<crate::update::Release, String> },
+    /// the new exe is in place and started: quit
+    Ready,
+    Failed(String),
+}
+
+static UPDATE_EVENT: std::sync::Mutex<Option<UpdateEvent>> = std::sync::Mutex::new(None);
+
+fn post_update_event(e: UpdateEvent) {
+    *UPDATE_EVENT.lock().unwrap_or_else(|e| e.into_inner()) = Some(e);
+    unsafe { PostMessageW(main_hwnd(), WM_UPDATE, 0, 0) };
+}
+
+/// The exe replaced by the last update (renamed, since a running exe cannot be deleted).
+fn old_exe() -> Option<std::path::PathBuf> {
+    std::env::current_exe().ok().map(|p| p.with_extension("exe.old"))
+}
+
+/// 10 s after launch, then once a day, if the option is on.
+fn start_update_checks() {
+    if let Some(old) = old_exe() {
+        let _ = std::fs::remove_file(old); // left by the previous update
+    }
+    std::thread::spawn(|| {
+        std::thread::sleep(std::time::Duration::from_secs(10));
+        loop {
+            if reg::flag("vAutoCheckUpdate", true) {
+                check_update(false);
+            }
+            std::thread::sleep(std::time::Duration::from_secs(24 * 3600));
+        }
+    });
+}
+
+/// Background thread: ask GitHub for the latest release.
+fn check_update(manual: bool) {
+    let result = crate::update::latest(UPDATE_ASSET);
+    post_update_event(UpdateEvent::Checked { manual, result });
+}
+
+fn handle_update_event() {
+    let Some(event) = UPDATE_EVENT.lock().unwrap_or_else(|e| e.into_inner()).take() else { return };
+    let current = env!("CARGO_PKG_VERSION");
+    match event {
+        UpdateEvent::Checked { result: Ok(r), .. } if crate::update::is_newer(&r.version, current) => {
+            let msg = format!(
+                "Đã có VKeyEngine {}.\nBạn đang dùng bản {current}. Tải và cài đặt ngay? VKeyEngine sẽ tự khởi động lại.",
+                r.version
+            );
+            if !confirm(null_mut(), &msg) {
+                return;
+            }
+            match r.asset {
+                Some(url) => {
+                    std::thread::spawn(move || install_update(&url));
+                }
+                None => open_releases_page(),
+            }
+        }
+        UpdateEvent::Checked { manual: true, result: Ok(_) } => {
+            alert(null_mut(), &format!("Bạn đang dùng bản mới nhất (VKeyEngine {current})."))
+        }
+        UpdateEvent::Checked { manual: true, result: Err(e) } => alert(null_mut(), &format!("Không kiểm tra được bản mới.\n{e}")),
+        UpdateEvent::Checked { .. } => {} // automatic check: stay quiet
+        UpdateEvent::Ready => unsafe {
+            DestroyWindow(main_hwnd());
+        },
+        UpdateEvent::Failed(e) => {
+            alert(null_mut(), &format!("Không cài được bản mới.\n{e}\nTrang tải về sẽ được mở để bạn cài thủ công."));
+            open_releases_page();
+        }
+    }
+}
+
+fn open_releases_page() {
+    unsafe {
+        ShellExecuteW(null_mut(), wide("open").as_ptr(), wide(crate::update::RELEASES_PAGE).as_ptr(), null(), null(), SW_SHOWNORMAL);
+    }
+}
+
+/// Background thread: download the new exe, put it in place of the running one (Windows
+/// lets a running exe be renamed, not overwritten) and start it; it waits for us to quit.
+fn install_update(url: &str) {
+    let result = (|| -> Result<(), String> {
+        let exe = std::env::current_exe().map_err(|e| e.to_string())?;
+        let old = old_exe().ok_or("không tìm thấy VKeyEngine.exe")?;
+        let new = std::env::temp_dir().join(UPDATE_ASSET);
+        crate::update::download(url, &new)?;
+        if std::fs::metadata(&new).map(|m| m.len()).unwrap_or(0) < 100_000 {
+            return Err("tệp tải về bị lỗi".into());
+        }
+        let _ = std::fs::remove_file(&old);
+        std::fs::rename(&exe, &old).map_err(|_| format!("không ghi được vào {}", exe.parent().map_or_else(String::new, |p| p.display().to_string())))?;
+        if let Err(e) = std::fs::copy(&new, &exe) {
+            let _ = std::fs::rename(&old, &exe); // put the running version back
+            return Err(e.to_string());
+        }
+        let _ = std::fs::remove_file(&new);
+        std::process::Command::new(&exe).arg(RESTARTED_ARG).spawn().map_err(|e| e.to_string())?;
+        Ok(())
+    })();
+    post_update_event(match result {
+        Ok(()) => UpdateEvent::Ready,
+        Err(e) => UpdateEvent::Failed(e),
+    });
+}
+

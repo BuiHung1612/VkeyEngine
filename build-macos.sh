@@ -70,9 +70,13 @@ cat > "$APP/Contents/Library/LaunchAgents/com.vkeyengine.app.agent.plist" <<AGEN
 </dict>
 </plist>
 AGENT
-# A real certificate keeps the Accessibility permission across rebuilds (an ad-hoc signature
-# changes every build, so macOS forgets the grant). Falls back to ad-hoc if it is missing.
+# A fixed certificate keeps the Accessibility permission across rebuilds and updates (an
+# ad-hoc signature changes every build, so macOS forgets the grant). CI sets SIGN_ID to the
+# self-signed "VKeyEngine Code Signing" certificate; locally the Apple Development one is
+# the default. Falls back to ad-hoc if the identity is missing. No -v: a self-signed
+# identity is "not trusted" but signs fine.
 SIGN_ID=${SIGN_ID:-"Apple Development: hungbt20@gmail.com (TMJH9RR69S)"}
-security find-identity -v -p codesigning | grep -qF "$SIGN_ID" || SIGN_ID=-
+security find-identity -p codesigning | grep -qF "$SIGN_ID" || SIGN_ID=-
+echo "Signing with: $SIGN_ID"
 codesign --force --deep --sign "$SIGN_ID" "$APP"
 echo "Built $APP ($VERSION)"

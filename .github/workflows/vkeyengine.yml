@@ -24,13 +24,35 @@ jobs:
 
   macos:
     runs-on: macos-latest
+    env:
+      # base64 of the .p12 and its password, see README "Ký bản macOS"
+      MACOS_CERT_P12: ${{ secrets.MACOS_CERT_P12 }}
+      MACOS_CERT_PASSWORD: ${{ secrets.MACOS_CERT_PASSWORD }}
     steps:
       - uses: actions/checkout@v7
       - uses: Swatinem/rust-cache@v2
       - run: cargo test
       - run: cargo clippy --release -- -D warnings
       - run: rustup target add aarch64-apple-darwin x86_64-apple-darwin
+      # a release signed ad-hoc would make every user re-grant Accessibility after updating
+      - name: Require the signing certificate for releases
+        if: startsWith(github.ref, 'refs/tags/v') && env.MACOS_CERT_P12 == ''
+        run: echo "::error::secret MACOS_CERT_P12 is missing" && exit 1
+      - name: Import the signing certificate
+        if: env.MACOS_CERT_P12 != ''
+        run: |
+          KC="$RUNNER_TEMP/signing.keychain-db"
+          security create-keychain -p ci "$KC"
+          security set-keychain-settings "$KC"
+          security unlock-keychain -p ci "$KC"
+          echo "$MACOS_CERT_P12" | base64 --decode > "$RUNNER_TEMP/cert.p12"
+          security import "$RUNNER_TEMP/cert.p12" -k "$KC" -P "$MACOS_CERT_PASSWORD" -T /usr/bin/codesign
+          security set-key-partition-list -S apple-tool:,apple: -s -k ci "$KC" > /dev/null
+          security list-keychains -d user -s "$KC" $(security list-keychains -d user | tr -d '"')
+          rm "$RUNNER_TEMP/cert.p12"
+          echo "SIGN_ID=VKeyEngine Code Signing" >> "$GITHUB_ENV"
       - run: ./build-macos.sh --universal
+      - run: codesign -dr - target/VKeyEngine.app
       - run: ditto -c -k --keepParent target/VKeyEngine.app target/VKeyEngine-macos.zip
       - uses: actions/upload-artifact@v7
         with:

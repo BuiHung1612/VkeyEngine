@@ -31,6 +31,7 @@ const T_MACROS: isize = 33;
 const T_ABOUT: isize = 34;
 const T_QUIT: isize = 35;
 const T_PAGE: isize = 36;
+const T_CHECK_UPDATE: isize = 37;
 const T_TOGGLE: isize = 100; // + index in TOGGLES
 const T_POPUP: isize = 200; // + index in POPUPS
 const T_RECORD_SWITCH: isize = 300;
@@ -90,6 +91,7 @@ static TOGGLES: &[Toggle] = &[
     t("vAutoCapsMacro", false, "Tự viết hoa theo từ gõ tắt (btw → Btw → BTW)", P_MACRO),
     t("RunOnStartup", true, "Khởi động cùng hệ thống", P_STARTUP),
     t("ShowUIOnStartup", false, "Hiện bảng điều khiển khi khởi động", P_STARTUP),
+    t("CheckUpdate", true, "Tự kiểm tra bản mới", P_STARTUP),
     t("vShowIconOnDock", false, "Hiện biểu tượng trên Dock", P_STARTUP),
     t("UseSmartSwitchKey", true, "Tự nhớ chế độ gõ Việt / Anh theo từng ứng dụng", P_SMART),
     t("vRememberCode", true, "Tự nhớ bảng mã theo từng ứng dụng", P_SMART),
@@ -503,6 +505,7 @@ fn did_finish_launching() {
         sys::set_run_at_login(at_login);
     }
     start_watchdog();
+    start_update_checks();
     if !start_tap() {
         sys::is_trusted(true);
         alert(
@@ -692,6 +695,7 @@ fn create_status_item() {
     menu.addItem(&NSMenuItem::separatorItem(mtm));
     menu.addItem(&with_symbol(menu_item("Bảng điều khiển…", T_SETTINGS, ","), "gearshape"));
     menu.addItem(&with_symbol(menu_item("Gõ tắt…", T_MACROS, ""), "text.badge.plus"));
+    menu.addItem(&with_symbol(menu_item("Kiểm tra bản mới…", T_CHECK_UPDATE, ""), "arrow.down.circle"));
     menu.addItem(&with_symbol(menu_item("Giới thiệu", T_ABOUT, ""), "info.circle"));
     menu.addItem(&NSMenuItem::separatorItem(mtm));
     menu.addItem(&with_symbol(menu_item("Thoát VKeyEngine", T_QUIT, "q"), "power"));
@@ -823,6 +827,9 @@ fn action(tag: isize, sender: &AnyObject) {
         }
         T_MACROS => show_macros(),
         T_ABOUT => show_about(),
+        T_CHECK_UPDATE => {
+            std::thread::spawn(|| check_update(true));
+        }
         T_QUIT => NSApplication::sharedApplication(mtm()).terminate(None),
         T_DEFAULTS => reset_defaults(),
         T_RECORD_SWITCH | T_RECORD_CONVERT => record_hotkey(tag, sender),
@@ -1675,3 +1682,129 @@ fn macro_export() {
         alert("Không ghi được file", &e.to_string());
     }
 }
+
+// ---------------------------------------------------------------- updates
+
+const UPDATE_ASSET: &str = "VKeyEngine-macos.zip";
+
+enum UpdateEvent {
+    Checked { manual: bool, result: Result<crate::update::Release, String> },
+    /// the new app is unpacked and the swap script waits for us to quit
+    Ready,
+    Failed(String),
+}
+
+static UPDATE_EVENT: std::sync::Mutex<Option<UpdateEvent>> = std::sync::Mutex::new(None);
+
+/// Run `f` on the main thread (from any thread).
+fn on_main(f: fn()) {
+    extern "C" {
+        static _dispatch_main_q: std::ffi::c_void;
+        fn dispatch_async_f(queue: *const std::ffi::c_void, context: *mut std::ffi::c_void, work: extern "C" fn(*mut std::ffi::c_void));
+    }
+    extern "C" fn trampoline(f: *mut std::ffi::c_void) {
+        let f: fn() = unsafe { std::mem::transmute(f) };
+        f();
+    }
+    unsafe { dispatch_async_f(&raw const _dispatch_main_q, f as *mut std::ffi::c_void, trampoline) };
+}
+
+fn post_update_event(e: UpdateEvent) {
+    *UPDATE_EVENT.lock().unwrap_or_else(|e| e.into_inner()) = Some(e);
+    on_main(handle_update_event);
+}
+
+/// 10 s after launch, then once a day, if the option is on.
+fn start_update_checks() {
+    std::thread::spawn(|| {
+        std::thread::sleep(std::time::Duration::from_secs(10));
+        loop {
+            if prefs::flag("CheckUpdate", true) {
+                check_update(false);
+            }
+            std::thread::sleep(std::time::Duration::from_secs(24 * 3600));
+        }
+    });
+}
+
+/// Background thread: ask GitHub for the latest release.
+fn check_update(manual: bool) {
+    let result = crate::update::latest(UPDATE_ASSET);
+    post_update_event(UpdateEvent::Checked { manual, result });
+}
+
+fn handle_update_event() {
+    let Some(event) = UPDATE_EVENT.lock().unwrap_or_else(|e| e.into_inner()).take() else { return };
+    let current = version();
+    match event {
+        UpdateEvent::Checked { result: Ok(r), .. } if crate::update::is_newer(&r.version, &current) => {
+            let info = format!("Bạn đang dùng bản {current}. Tải và cài đặt bản {} ngay? VKeyEngine sẽ tự khởi động lại.", r.version);
+            if !confirm(&format!("Đã có VKeyEngine {}", r.version), &info) {
+                return;
+            }
+            match r.asset {
+                Some(url) => {
+                    std::thread::spawn(move || install_update(&url));
+                }
+                None => open_releases_page(),
+            }
+        }
+        UpdateEvent::Checked { manual: true, result: Ok(_) } => {
+            alert("Bạn đang dùng bản mới nhất", &format!("VKeyEngine {current}"));
+        }
+        UpdateEvent::Checked { manual: true, result: Err(e) } => alert("Không kiểm tra được bản mới", &e),
+        UpdateEvent::Checked { .. } => {} // automatic check: stay quiet
+        UpdateEvent::Ready => NSApplication::sharedApplication(mtm()).terminate(None),
+        UpdateEvent::Failed(e) => {
+            alert("Không cài được bản mới", &format!("{e}\nTrang tải về sẽ được mở để bạn cài thủ công."));
+            open_releases_page();
+        }
+    }
+}
+
+fn open_releases_page() {
+    let _ = std::process::Command::new("/usr/bin/open").arg(crate::update::RELEASES_PAGE).status();
+}
+
+/// Background thread: download and unpack the new app, then start a script that swaps
+/// the bundles once this process has quit and opens the new one.
+fn install_update(url: &str) {
+    let result = (|| -> Result<(), String> {
+        let app = std::env::current_exe().map_err(|e| e.to_string())?;
+        // .../VKeyEngine.app/Contents/MacOS/VKeyEngine -> .../VKeyEngine.app
+        let app = app.ancestors().nth(3).filter(|p| p.extension().is_some_and(|e| e == "app")).ok_or("không tìm thấy VKeyEngine.app")?;
+        let parent = app.parent().ok_or("thư mục cài đặt không hợp lệ")?;
+        let probe = parent.join(".vkeyengine-update-probe");
+        std::fs::write(&probe, b"").map_err(|_| format!("không ghi được vào {}", parent.display()))?;
+        let _ = std::fs::remove_file(&probe);
+
+        let dir = std::env::temp_dir().join("vkeyengine-update");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+        let zip = dir.join(UPDATE_ASSET);
+        crate::update::download(url, &zip)?;
+        let unpacked = std::process::Command::new("/usr/bin/ditto").arg("-x").arg("-k").arg(&zip).arg(&dir).status();
+        let new_app = dir.join("VKeyEngine.app");
+        if !unpacked.is_ok_and(|s| s.success()) || !new_app.join("Contents/MacOS/VKeyEngine").exists() {
+            return Err("tệp tải về bị lỗi".into());
+        }
+        let script = r#"while kill -0 "$1" 2>/dev/null; do sleep 0.2; done
+rm -rf "$2.old" && mv "$2" "$2.old" && mv "$3" "$2" && rm -rf "$2.old"
+open "$2""#;
+        use std::os::unix::process::CommandExt;
+        std::process::Command::new("/bin/sh")
+            .args(["-c", script, "sh"])
+            .arg(std::process::id().to_string())
+            .arg(app)
+            .arg(&new_app)
+            .process_group(0) // outlive us, even when launchd ends our process group
+            .spawn()
+            .map_err(|e| e.to_string())?;
+        Ok(())
+    })();
+    post_update_event(match result {
+        Ok(()) => UpdateEvent::Ready,
+        Err(e) => UpdateEvent::Failed(e),
+    });
+}
+

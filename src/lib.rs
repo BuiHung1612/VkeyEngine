@@ -8,6 +8,7 @@ pub mod sim;
 pub mod smart_switch;
 pub mod stats;
 pub mod tables;
+pub mod update;
 
 #[cfg(target_os = "macos")]
 pub mod mac;
