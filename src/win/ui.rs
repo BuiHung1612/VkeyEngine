@@ -876,11 +876,12 @@ fn tray_menu() {
         AppendMenuW(menu, MF_POPUP, inputs as usize, wide(&format!("Kiểu gõ: {}", INPUT_TYPES[s.input_type as usize])).as_ptr());
         let codes = sub(&CODE_TABLES, T_CODE, s.code_table as usize);
         AppendMenuW(menu, MF_POPUP, codes as usize, wide(&format!("Bảng mã: {}", CODE_TABLES[s.code_table as usize])).as_ptr());
-        AppendMenuW(menu, MF_SEPARATOR, 0, null());
-        add(menu, T_CONVERT_TOOL, "Công cụ chuyển mã…", 0);
+        let convert = CreatePopupMenu();
+        add(convert, T_CONVERT_TOOL, "Công cụ chuyển mã…", 0);
         let key = hotkey::describe(o.convert_hotkey);
         let quick = if key.is_empty() { "Chuyển mã nhanh".to_string() } else { format!("Chuyển mã nhanh\t{key}") };
-        add(menu, T_QUICK_CONVERT, &quick, 0);
+        add(convert, T_QUICK_CONVERT, &quick, 0);
+        AppendMenuW(menu, MF_POPUP, convert as usize, wide("Chuyển mã").as_ptr());
         AppendMenuW(menu, MF_SEPARATOR, 0, null());
         add(menu, T_SETTINGS, "Bảng điều khiển…", 0);
         add(menu, T_MACROS, "Gõ tắt…", 0);
@@ -1457,7 +1458,8 @@ fn build(kind: Kind, page: usize) -> Page {
             let lines = [
                 ("VKeyEngine".to_string(), 20.0, true, false, 28.0),
                 (format!("Phiên bản {}", env!("CARGO_PKG_VERSION")), 12.0, false, true, 22.0),
-                ("Bộ gõ tiếng Việt mã nguồn mở".to_string(), 13.0, false, false, 20.0),
+                ("Bộ gõ tiếng Việt mã nguồn mở".to_string(), 13.0, false, false, 24.0),
+                ("Viết lại bởi Bùi Hùng (BuiHung1612)".to_string(), 12.0, false, false, 20.0),
                 ("Dựa trên OpenKey của Mai Vũ Tuyên · GPL v3".to_string(), 12.0, false, true, 20.0),
             ];
             for (s, size, bold, secondary, h) in lines {

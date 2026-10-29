@@ -48,7 +48,7 @@ cat > "$APP/Contents/Info.plist" <<PLIST
 	<key>LSMinimumSystemVersion</key><string>11.0</string>
 	<key>LSUIElement</key><true/>
 	<key>NSAccentColorName</key><string>AccentColor</string>
-	<key>NSHumanReadableCopyright</key><string>VKeyEngine, GPL v3. Based on OpenKey © 2019 Mai Vu Tuyen.</string>
+	<key>NSHumanReadableCopyright</key><string>© 2026 Bùi Hùng (BuiHung1612). GPL v3. Based on OpenKey © 2019 Mai Vu Tuyen.</string>
 	<key>NSPrincipalClass</key><string>NSApplication</string>
 </dict>
 </plist>

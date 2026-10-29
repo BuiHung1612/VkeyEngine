@@ -46,8 +46,8 @@ CI (`.github/workflows/vkeyengine.yml`) chạy test và build cả hai bản tr�
 
 Người dùng chuyển từ OpenKey: cấu hình và gõ tắt được chép sang ở lần chạy đầu.
 
-## Giấy phép
+## Tác giả và giấy phép
 
-GPL v3 (xem `LICENSE`).
+VKeyEngine do Bùi Hùng ([BuiHung1612](https://github.com/BuiHung1612)) viết lại, là bản phát triển tiếp từ [OpenKey](https://github.com/tuyenvm/OpenKey) © 2019 Mai Vũ Tuyên. Giấy phép GPL v3 (xem `LICENSE`).
 
-`src/english.txt` (các từ tiếng Anh thông dụng mà Telex làm biến dạng) được lọc từ danh sách 50 000 từ của [FrequencyWords](https://github.com/hermitdave/FrequencyWords) © Hermit Dave, giấy phép [CC BY-SA 4.0](https://creativecommons.org/licenses/by-sa/4.0/). VKeyEngine là bản phát triển tiếp từ [OpenKey](https://github.com/tuyenvm/OpenKey) © 2019 Mai Vũ Tuyên, cũng theo GPL v3.
+`src/english.txt` (các từ tiếng Anh thông dụng mà Telex làm biến dạng) được lọc từ danh sách 50 000 từ của [FrequencyWords](https://github.com/hermitdave/FrequencyWords) © Hermit Dave, giấy phép [CC BY-SA 4.0](https://creativecommons.org/licenses/by-sa/4.0/).

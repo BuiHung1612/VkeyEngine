@@ -13,7 +13,7 @@ use crate::convert::convert;
 use block2::RcBlock;
 use objc2::rc::Retained;
 use objc2::runtime::{AnyObject, NSObject, NSObjectProtocol, ProtocolObject, Sel};
-use objc2::{define_class, msg_send, sel, ClassType, DefinedClass, MainThreadMarker, MainThreadOnly};
+use objc2::{define_class, msg_send, sel, DefinedClass, MainThreadMarker, MainThreadOnly};
 use objc2_app_kit::*;
 use objc2_foundation::*;
 use std::cell::RefCell;
@@ -203,6 +203,7 @@ struct Ui {
     menu_title: Option<Retained<NSTextField>>,
     menu_status: Option<Retained<NSTextField>>,
     menu_input_holder: Option<Retained<NSMenuItem>>,
+    menu_code_holder: Option<Retained<NSMenuItem>>,
     menu_exclude: Option<Retained<NSMenuItem>>,
     /// "Nâng cao" page: names of the excluded apps
     exclude_value: Option<Retained<NSTextField>>,
@@ -649,19 +650,6 @@ fn with_symbol(item: Retained<NSMenuItem>, symbol: &str) -> Retained<NSMenuItem>
     item
 }
 
-fn section_header(menu: &NSMenu, title: &str) {
-    let cls = NSMenuItem::class();
-    let native: bool = unsafe { msg_send![cls, respondsToSelector: sel!(sectionHeaderWithTitle:)] }; // macOS 14+
-    let item = if native {
-        NSMenuItem::sectionHeaderWithTitle(&ns(title), mtm())
-    } else {
-        let i = menu_item(title, 0, "");
-        i.setEnabled(false);
-        i
-    };
-    menu.addItem(&item);
-}
-
 /// Top of the menu: app icon, current mode, and a Vietnamese / English switch.
 fn menu_header() -> Retained<NSMenuItem> {
     let mtm = mtm();
@@ -713,17 +701,11 @@ fn create_status_item() {
     menu.addItem(&exclude);
     menu.addItem(&NSMenuItem::separatorItem(mtm));
     let input_holder = with_symbol(submenu(&menu, "Kiểu gõ", &inputs), "keyboard");
-    menu.addItem(&NSMenuItem::separatorItem(mtm));
-    section_header(&menu, "Bảng mã");
+    // the code tables matter only for old documents (TCVN3, VNI fonts): one submenu
     let codes: Vec<_> = CODE_TABLES.iter().enumerate().map(|(i, s)| menu_item(s, T_CODE + i as isize, "")).collect();
-    for c in &codes[..3] {
-        menu.addItem(c);
-    }
-    submenu(&menu, "Bảng mã khác", &codes[3..]);
-    menu.addItem(&NSMenuItem::separatorItem(mtm));
-    menu.addItem(&with_symbol(menu_item("Công cụ chuyển mã…", T_CONVERT_TOOL, ""), "arrow.left.arrow.right"));
-    let quick = with_symbol(menu_item("Chuyển mã nhanh", T_QUICK_CONVERT, ""), "bolt");
-    menu.addItem(&quick);
+    let code_holder = with_symbol(submenu(&menu, "Bảng mã", &codes), "textformat");
+    let quick = menu_item("Chuyển mã nhanh", T_QUICK_CONVERT, "");
+    with_symbol(submenu(&menu, "Chuyển mã", &[menu_item("Công cụ chuyển mã…", T_CONVERT_TOOL, ""), quick.clone()]), "arrow.left.arrow.right");
     menu.addItem(&NSMenuItem::separatorItem(mtm));
     menu.addItem(&with_symbol(menu_item("Bảng điều khiển…", T_SETTINGS, ","), "gearshape"));
     menu.addItem(&with_symbol(menu_item("Gõ tắt…", T_MACROS, ""), "text.badge.plus"));
@@ -736,6 +718,7 @@ fn create_status_item() {
     ui(|u| {
         u.status_item = Some(item);
         u.menu_input_holder = Some(input_holder);
+        u.menu_code_holder = Some(code_holder);
         u.menu_exclude = Some(exclude);
         u.menu_input = inputs;
         u.menu_code = codes;
@@ -800,6 +783,10 @@ pub fn refresh() {
         }
         if let Some(m) = &u.menu_input_holder {
             m.setTitle(&ns(&format!("Kiểu gõ: {input}")));
+        }
+        if let Some(m) = &u.menu_code_holder {
+            let code = CODE_TABLES.get(s.code_table as usize).copied().unwrap_or_default();
+            m.setTitle(&ns(&format!("Bảng mã: {code}")));
         }
         if let Some(m) = &u.menu_exclude {
             let app = if front_name.is_empty() { "ứng dụng này".to_string() } else { front_name.clone() };
@@ -1418,7 +1405,10 @@ fn present(win: &NSWindow) {
 /// The app icon as macOS draws it (masked to the system shape; the file itself is a full
 /// square, which macOS 26+ needs to not shrink it into a gray frame).
 fn app_icon() -> Retained<NSImage> {
-    NSWorkspace::sharedWorkspace().iconForFile(&NSBundle::mainBundle().bundlePath())
+    let icon = NSWorkspace::sharedWorkspace().iconForFile(&NSBundle::mainBundle().bundlePath());
+    // 32 pt by default, and image views only scale down: ask for a large rendition
+    icon.setSize(NSSize::new(256.0, 256.0));
+    icon
 }
 
 fn version() -> String {
@@ -1687,7 +1677,8 @@ pub fn show_about() {
     for (s, size, bold, secondary, h) in [
         ("VKeyEngine", 20.0, true, false, 26.0),
         (&*format!("Phiên bản {}", version()), 12.0, false, true, 22.0),
-        ("Bộ gõ tiếng Việt mã nguồn mở", 13.0, false, false, 18.0),
+        ("Bộ gõ tiếng Việt mã nguồn mở", 13.0, false, false, 22.0),
+        ("Viết lại bởi Bùi Hùng (BuiHung1612)", 12.0, false, false, 18.0),
         ("Dựa trên OpenKey của Mai Vũ Tuyên · GPL v3", 12.0, false, true, 18.0),
     ] {
         let l = text(s, size, bold, secondary);

@@ -6,6 +6,8 @@ fn main() {
         let mut res = winresource::WindowsResource::new();
         res.set_icon("windows/app.ico").set_manifest_file("windows/VKeyEngine.manifest");
         res.set("ProductName", "VKeyEngine").set("FileDescription", "VKeyEngine - Bộ gõ tiếng Việt");
+        res.set("CompanyName", "Bùi Hùng (BuiHung1612)");
+        res.set("LegalCopyright", "© 2026 Bùi Hùng. GPL v3. Based on OpenKey © 2019 Mai Vu Tuyen.");
         res.compile().expect("windows resources");
     }
 }
