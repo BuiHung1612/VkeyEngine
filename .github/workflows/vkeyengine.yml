@@ -73,7 +73,8 @@ jobs:
         with:
           path: dist
           merge-multiple: true
-      - run: mv dist/VKeyEngine.exe dist/VKeyEngine-windows-x64.exe
+      # old name kept for the updater of 1.0.11 and earlier
+      - run: cp dist/VKeyEngine.exe dist/VKeyEngine-windows-x64.exe
       - run: gh release create "$GITHUB_REF_NAME" dist/* --repo "$GITHUB_REPOSITORY" --title "VKeyEngine $GITHUB_REF_NAME" --generate-notes
         env:
           GH_TOKEN: ${{ github.token }}

@@ -2472,7 +2472,7 @@ mod tests {
 
 // ---------------------------------------------------------------- updates
 
-const UPDATE_ASSET: &str = "VKeyEngine-windows-x64.exe";
+const UPDATE_ASSET: &str = "VKeyEngine.exe";
 
 enum UpdateEvent {
     Checked { manual: bool, result: Result<crate::update::Release, String> },
