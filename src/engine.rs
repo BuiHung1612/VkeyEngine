@@ -537,13 +537,12 @@ impl Engine {
                 // end consonant "ch", "t" can not go with "~", "`", "?"
                 if self.spelling_ok {
                     let bad_mark = |w: u32| !((w & MARK1_MASK) != 0 || (w & MARK5_MASK) != 0 || (w & MARK_MASK) == 0);
-                    if idx >= 3
+                    let ch_end = idx >= 3
                         && self.chr(idx - 1) == KEY_H
                         && self.chr(idx - 2) == KEY_C
-                        && bad_mark(self.tw(idx - 3))
-                    {
-                        self.spelling_ok = false;
-                    } else if idx >= 2 && self.chr(idx - 1) == KEY_T && bad_mark(self.tw(idx - 2)) {
+                        && bad_mark(self.tw(idx - 3));
+                    let t_end = idx >= 2 && self.chr(idx - 1) == KEY_T && bad_mark(self.tw(idx - 2));
+                    if ch_end || t_end {
                         self.spelling_ok = false;
                     }
                 }
@@ -726,10 +725,9 @@ impl Engine {
         if self.is_correct
             && entry.len() > 1
             && (self.is_key_f(mark_key) || self.is_key_x(mark_key) || self.is_key_r(mark_key))
+            && (entry[1] == KEY_C || entry[1] == KEY_T || (entry.len() > 2 && entry[2] == KEY_T))
         {
-            if entry[1] == KEY_C || entry[1] == KEY_T || (entry.len() > 2 && entry[2] == KEY_T) {
-                self.is_correct = false;
-            }
+            self.is_correct = false;
         }
         if self.is_correct && k >= 0 && self.chr(k) == self.chr(k + 1) {
             self.is_correct = false;
@@ -751,7 +749,7 @@ impl Engine {
                     self.vei = i;
                 }
                 if !for_grammar
-                    && i - 1 >= 0
+                    && i > 0
                     && ((self.chr(i) == KEY_I && self.chr(i - 1) == KEY_G)
                         || (self.chr(i) == KEY_U && self.chr(i - 1) == KEY_Q))
                 {
@@ -763,7 +761,7 @@ impl Engine {
             i -= 1;
         }
         // don't count "u" in "qu" as a vowel
-        if self.vsi - 1 >= 0 && self.chr(self.vsi) == KEY_U && self.chr(self.vsi - 1) == KEY_Q {
+        if self.vsi > 0 && self.chr(self.vsi) == KEY_U && self.chr(self.vsi - 1) == KEY_Q {
             self.vsi += 1;
             self.vowel_count -= 1;
         }
@@ -1069,7 +1067,7 @@ impl Engine {
                         if vsi + 2 < idx && self.chr(vsi + 2) == KEY_N {
                             self.or_tw(vsi, TONEW_MASK);
                         }
-                    } else if vsi - 1 >= 0 && self.chr(vsi - 1) == KEY_Q {
+                    } else if vsi > 0 && self.chr(vsi - 1) == KEY_Q {
                         self.or_tw(vsi + 1, TONEW_MASK);
                     } else {
                         self.or_tw(vsi, TONEW_MASK);

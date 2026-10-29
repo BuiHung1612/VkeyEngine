@@ -6,6 +6,7 @@ pub mod macros;
 #[doc(hidden)]
 pub mod sim;
 pub mod smart_switch;
+pub mod stats;
 pub mod tables;
 
 #[cfg(target_os = "macos")]

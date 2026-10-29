@@ -53,6 +53,23 @@ cat > "$APP/Contents/Info.plist" <<PLIST
 </dict>
 </plist>
 PLIST
+# Launch agent: starts the app at login and restarts it if it is killed or crashes
+# (KeepAlive on unsuccessful exit only, so Quit stays quit).
+mkdir -p "$APP/Contents/Library/LaunchAgents"
+cat > "$APP/Contents/Library/LaunchAgents/com.vkeyengine.app.agent.plist" <<AGENT
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>Label</key><string>com.vkeyengine.app.agent</string>
+	<key>BundleProgram</key><string>Contents/MacOS/VKeyEngine</string>
+	<key>RunAtLoad</key><true/>
+	<key>KeepAlive</key><dict><key>SuccessfulExit</key><false/></dict>
+	<key>ProcessType</key><string>Interactive</string>
+	<key>LimitLoadToSessionType</key><string>Aqua</string>
+</dict>
+</plist>
+AGENT
 # A real certificate keeps the Accessibility permission across rebuilds (an ad-hoc signature
 # changes every build, so macOS forgets the grant). Falls back to ad-hoc if it is missing.
 SIGN_ID=${SIGN_ID:-"Apple Development: hungbt20@gmail.com (TMJH9RR69S)"}

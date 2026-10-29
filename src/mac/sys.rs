@@ -15,6 +15,7 @@ extern "C" {
 #[link(name = "Carbon", kind = "framework")]
 extern "C" {
     fn TISCopyCurrentKeyboardInputSource() -> *const c_void;
+    fn IsSecureEventInputEnabled() -> bool;
     fn TISGetInputSourceProperty(source: *const c_void, key: *const c_void) -> *const c_void;
     static kTISPropertyInputSourceLanguages: *const c_void;
     fn CFRelease(cf: *const c_void);
@@ -54,21 +55,84 @@ pub fn input_source_is_english() -> bool {
     }
 }
 
-/// Start at login via SMAppService (macOS 13+).
-pub fn set_run_on_startup(on: bool) {
-    let Some(cls) = AnyClass::get(c"SMAppService") else { return };
+/// Label of the launch agent in Contents/Library/LaunchAgents (see build-macos.sh).
+pub const AGENT_LABEL: &str = "com.vkeyengine.app.agent";
+
+/// SMAppService (macOS 13+) for the launch agent, or for the plain login item.
+fn service(agent: bool) -> *mut AnyObject {
+    let Some(cls) = AnyClass::get(c"SMAppService") else { return std::ptr::null_mut() };
     unsafe {
-        let service: *mut AnyObject = msg_send![cls, mainAppService];
-        if service.is_null() {
+        if agent {
+            let plist = NSString::from_str(&format!("{AGENT_LABEL}.plist"));
+            msg_send![cls, agentServiceWithPlistName: &*plist]
+        } else {
+            msg_send![cls, mainAppService]
+        }
+    }
+}
+
+/// SMAppServiceStatus: 0 not registered, 1 enabled, 2 requires approval, 3 not found.
+fn status(service: *mut AnyObject) -> isize {
+    unsafe { msg_send![service, status] }
+}
+
+/// Start at login through the launch agent, which also restarts the app if it is killed
+/// (memory pressure) or crashes, but not after Quit (a successful exit).
+pub fn set_launch_agent(on: bool) {
+    unsafe {
+        let mut err: *mut AnyObject = std::ptr::null_mut();
+        // earlier builds used the plain login item, which does not restart the app
+        let legacy = service(false);
+        if !legacy.is_null() && status(legacy) == 1 {
+            let _: bool = msg_send![legacy, unregisterAndReturnError: &mut err];
+        }
+        let agent = service(true);
+        if agent.is_null() || on == launch_agent_enabled() {
             return;
         }
-        let mut err: *mut AnyObject = std::ptr::null_mut();
         let _: bool = if on {
-            msg_send![service, registerAndReturnError: &mut err]
+            msg_send![agent, registerAndReturnError: &mut err]
         } else {
-            msg_send![service, unregisterAndReturnError: &mut err]
+            msg_send![agent, unregisterAndReturnError: &mut err]
         };
     }
+}
+
+/// Registered and allowed to run (SMAppServiceStatusEnabled).
+pub fn launch_agent_enabled() -> bool {
+    let agent = service(true);
+    !agent.is_null() && status(agent) == 1
+}
+
+/// This process was started by the launch agent.
+pub fn under_launch_agent() -> bool {
+    std::env::var("XPC_SERVICE_NAME").as_deref() == Ok(AGENT_LABEL)
+}
+
+/// Ask launchd to start the agent copy of the app (no-op if it already runs).
+pub fn start_launch_agent() -> bool {
+    extern "C" {
+        fn getuid() -> u32;
+    }
+    let target = format!("gui/{}/{AGENT_LABEL}", unsafe { getuid() });
+    std::process::Command::new("/bin/launchctl").args(["kickstart", &target]).status().is_ok_and(|s| s.success())
+}
+
+/// Name of the app that turned on Secure Input (a password field, Terminal's "Secure
+/// Keyboard Entry"...). While it is on, macOS gives keystrokes to no input method.
+pub fn secure_input_owner() -> Option<String> {
+    if !unsafe { IsSecureEventInputEnabled() } {
+        return None;
+    }
+    let name = (|| {
+        let session = objc2_core_graphics::CGSessionCopyCurrentDictionary()?;
+        let session: &NSDictionary<NSString, AnyObject> =
+            unsafe { &*(objc2_core_foundation::CFRetained::as_ptr(&session).as_ptr() as *const _) };
+        let pid = session.objectForKey(&NSString::from_str("kCGSSessionSecureInputPID"))?.downcast::<NSNumber>().ok()?;
+        let app = objc2_app_kit::NSRunningApplication::runningApplicationWithProcessIdentifier(pid.intValue())?;
+        app.localizedName().map(|s| s.to_string())
+    })();
+    Some(name.unwrap_or_else(|| "Một ứng dụng".into()))
 }
 
 /// Spotlight search panel is on screen (it is not the frontmost app, so check windows).
@@ -101,6 +165,45 @@ fn scan_for_spotlight() -> bool {
             .and_then(|o| o.downcast::<NSString>().ok())
             .is_some_and(|s| s.to_string() == "Spotlight")
     })
+}
+
+/// CPU time used by this process, and its memory footprint (the number Activity Monitor shows).
+pub fn process_usage() -> (std::time::Duration, u64) {
+    #[repr(C)]
+    struct Timespec {
+        sec: i64,
+        nsec: i64,
+    }
+    /// struct rusage_info_v0 (<libproc.h>)
+    #[repr(C)]
+    #[derive(Default)]
+    struct RusageInfo {
+        uuid: [u8; 16],
+        user_time: u64,
+        system_time: u64,
+        pkg_idle_wkups: u64,
+        interrupt_wkups: u64,
+        pageins: u64,
+        wired_size: u64,
+        resident_size: u64,
+        phys_footprint: u64,
+        proc_start_abstime: u64,
+        proc_exit_abstime: u64,
+    }
+    extern "C" {
+        fn clock_gettime(clock: u32, tp: *mut Timespec) -> i32;
+        fn proc_pid_rusage(pid: i32, flavor: i32, buffer: *mut c_void) -> i32;
+        fn getpid() -> i32;
+    }
+    const CLOCK_PROCESS_CPUTIME_ID: u32 = 12;
+    const RUSAGE_INFO_V0: i32 = 0;
+    let mut t = Timespec { sec: 0, nsec: 0 };
+    let mut info = RusageInfo::default();
+    unsafe {
+        clock_gettime(CLOCK_PROCESS_CPUTIME_ID, &mut t);
+        proc_pid_rusage(getpid(), RUSAGE_INFO_V0, &mut info as *mut RusageInfo as *mut c_void);
+    }
+    (std::time::Duration::new(t.sec as u64, t.nsec as u32), info.phys_footprint)
 }
 
 pub fn beep() {

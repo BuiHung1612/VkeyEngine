@@ -246,6 +246,24 @@ impl App {
     }
 }
 
+/// CPU time used by this process, and its private memory.
+pub fn process_usage() -> (std::time::Duration, u64) {
+    use windows_sys::Win32::Foundation::FILETIME;
+    use windows_sys::Win32::System::ProcessStatus::{GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS, PROCESS_MEMORY_COUNTERS_EX};
+    use windows_sys::Win32::System::Threading::{GetCurrentProcess, GetProcessTimes};
+    unsafe {
+        let zero = FILETIME { dwLowDateTime: 0, dwHighDateTime: 0 };
+        let (mut created, mut exited, mut kernel, mut user) = (zero, zero, zero, zero);
+        GetProcessTimes(GetCurrentProcess(), &mut created, &mut exited, &mut kernel, &mut user);
+        let ticks = |f: FILETIME| ((f.dwHighDateTime as u64) << 32) | f.dwLowDateTime as u64; // 100 ns
+        let cpu = std::time::Duration::from_nanos((ticks(kernel) + ticks(user)) * 100);
+        let mut mem: PROCESS_MEMORY_COUNTERS_EX = std::mem::zeroed();
+        mem.cb = size_of::<PROCESS_MEMORY_COUNTERS_EX>() as u32;
+        GetProcessMemoryInfo(GetCurrentProcess(), &mut mem as *mut _ as *mut PROCESS_MEMORY_COUNTERS, mem.cb);
+        (cpu, mem.PrivateUsage as u64)
+    }
+}
+
 /// Run the app (returns when it quits).
 pub fn run() {
     reg::import_openkey();

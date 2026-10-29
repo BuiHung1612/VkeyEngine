@@ -180,6 +180,14 @@ fn set_popup_value(i: usize, v: i64) {
 
 // ---------------------------------------------------------------- UI state
 
+/// Why typing may not work right now, shown in the menu.
+#[derive(Default, Clone, PartialEq)]
+struct Health {
+    no_permission: bool,
+    /// app that turned on Secure Input
+    secure_input: Option<String>,
+}
+
 #[derive(Default)]
 struct Ui {
     status_item: Option<Retained<NSStatusItem>>,
@@ -199,6 +207,10 @@ struct Ui {
     /// settings pages with their heights, and the height of the header above them
     pages: Vec<(Retained<NSView>, f64)>,
     pages_top: f64,
+    page: usize,
+    /// "Hoạt động" page: value labels (see ACTIVITY_ROWS) and the CPU graph
+    activity_values: Vec<Retained<NSTextField>>,
+    cpu_graph: Option<Retained<GraphView>>,
     macros: Option<Retained<NSWindow>>,
     convert: Option<Retained<NSWindow>>,
     about: Option<Retained<NSWindow>>,
@@ -207,7 +219,8 @@ struct Ui {
     macro_content: Option<Retained<NSTextField>>,
     macro_add: Option<Retained<NSButton>>,
     key_monitor: Option<Retained<AnyObject>>,
-    access_timer: Option<Retained<NSTimer>>,
+    watchdog: Option<Retained<NSTimer>>,
+    health: Health,
 }
 
 thread_local! {
@@ -215,6 +228,9 @@ thread_local! {
     static DELEGATE: RefCell<Option<Retained<Delegate>>> = const { RefCell::new(None) };
 }
 
+/// Borrow the UI state. Never call into AppKit from `f` in a way that can call back into
+/// our delegate (reloadData, makeFirstResponder...): the nested `ui()` would panic, and a
+/// panic aborts the app. Clone the handles out and call AppKit after.
 fn ui<R>(f: impl FnOnce(&mut Ui) -> R) -> R {
     UI.with(|u| f(&mut u.borrow_mut()))
 }
@@ -290,6 +306,14 @@ define_class!(
             did_finish_launching();
         }
 
+        #[unsafe(method(applicationWillTerminate:))]
+        fn will_terminate(&self, _n: &NSNotification) {
+            // turned off while running as the agent: unregistering earlier would have killed us
+            if !prefs::flag("RunOnStartup", true) {
+                sys::set_launch_agent(false);
+            }
+        }
+
         #[unsafe(method(applicationShouldHandleReopen:hasVisibleWindows:))]
         fn should_handle_reopen(&self, _app: &NSApplication, _visible: bool) -> bool {
             show_settings();
@@ -361,6 +385,56 @@ define_class!(
     }
 );
 
+define_class!(
+    /// CPU usage over the last minutes: a line with a light fill under it.
+    #[unsafe(super(NSView))]
+    #[thread_kind = MainThreadOnly]
+    #[ivars = RefCell<Vec<f32>>]
+    struct GraphView;
+
+    impl GraphView {
+        #[unsafe(method(drawRect:))]
+        fn draw_rect(&self, _dirty: NSRect) {
+            let values = self.ivars().borrow();
+            if values.len() < 2 {
+                return;
+            }
+            let b = self.bounds();
+            let (w, h) = (b.size.width, b.size.height);
+            // at least 5 % full scale, so idle noise stays flat
+            let max = values.iter().fold(5.0f32, |m, &v| m.max(v)) as f64;
+            let step = w / (crate::stats::HISTORY - 1) as f64;
+            let x0 = w - step * (values.len() - 1) as f64; // newest sample on the right
+            let point = |i: usize, v: f32| NSPoint::new(x0 + step * i as f64, 4.0 + (h - 8.0) * v as f64 / max);
+            let line = NSBezierPath::bezierPath();
+            for (i, &v) in values.iter().enumerate() {
+                if i == 0 {
+                    line.moveToPoint(point(i, v));
+                } else {
+                    line.lineToPoint(point(i, v));
+                }
+            }
+            let fill = line.copy();
+            fill.lineToPoint(NSPoint::new(w, 0.0));
+            fill.lineToPoint(NSPoint::new(x0, 0.0));
+            fill.closePath();
+            NSColor::labelColor().colorWithAlphaComponent(0.1).setFill();
+            fill.fill();
+            line.setLineWidth(1.5);
+            line.setLineJoinStyle(NSLineJoinStyle::Round);
+            NSColor::labelColor().setStroke();
+            line.stroke();
+        }
+    }
+);
+
+impl GraphView {
+    fn new(frame: NSRect) -> Retained<Self> {
+        let this = Self::alloc(mtm()).set_ivars(RefCell::new(Vec::new()));
+        unsafe { msg_send![super(this), initWithFrame: frame] }
+    }
+}
+
 impl Delegate {
     fn new(mtm: MainThreadMarker) -> Retained<Self> {
         let this = Self::alloc(mtm).set_ivars(DelegateIvars::default());
@@ -370,8 +444,19 @@ impl Delegate {
 
 // ---------------------------------------------------------------- startup
 
-/// One VKeyEngine per user session (several users can each run their own).
+/// One VKeyEngine per user session (several users can each run their own). The launch agent
+/// copy waits a little: it may start while the copy that handed over to it is still exiting.
 pub fn acquire_single_instance_lock() -> bool {
+    let tries = if sys::under_launch_agent() { 50 } else { 1 };
+    (0..tries).any(|i| {
+        if i > 0 {
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        try_lock()
+    })
+}
+
+fn try_lock() -> bool {
     let Some(home) = std::env::var_os("HOME") else { return true };
     let dir = std::path::Path::new(&home).join("Library/Application Support/VKeyEngine");
     let _ = std::fs::create_dir_all(&dir);
@@ -403,7 +488,15 @@ fn did_finish_launching() {
     with_app(|a| {
         a.on_active_app_changed();
     });
-    sys::set_run_on_startup(prefs::flag("RunOnStartup", true));
+    if prefs::flag("RunOnStartup", true) {
+        sys::set_launch_agent(true);
+        // Started by hand: let launchd run the app instead, so it is restarted if killed.
+        if !sys::under_launch_agent() && sys::launch_agent_enabled() && sys::start_launch_agent() {
+            NSApplication::sharedApplication(mtm()).terminate(None);
+            return;
+        }
+    }
+    start_watchdog();
     if !start_tap() {
         sys::is_trusted(true);
         alert(
@@ -411,7 +504,6 @@ fn did_finish_launching() {
             "Hãy bật VKeyEngine trong Cài đặt hệ thống → Quyền riêng tư & Bảo mật → Trợ năng. \
              VKeyEngine sẽ tự hoạt động ngay khi được cấp quyền.",
         );
-        wait_for_permission();
     } else if prefs::flag("ShowUIOnStartup", false) {
         show_settings();
     }
@@ -434,15 +526,32 @@ fn start_tap() -> bool {
     with_app(|a| a.tap.start()).unwrap_or(false)
 }
 
-fn wait_for_permission() {
-    let block = RcBlock::new(|timer: NonNull<NSTimer>| {
-        if start_tap() {
-            unsafe { timer.as_ref().invalidate() };
-            ui(|u| u.access_timer = None);
+/// Every 2 s: keep the key tap alive whatever happened (permission granted late or revoked,
+/// tap port invalidated, wake notification missed...) and keep the menu's warning current.
+fn start_watchdog() {
+    let block = RcBlock::new(|_t: NonNull<NSTimer>| watchdog());
+    let timer = unsafe { NSTimer::scheduledTimerWithTimeInterval_repeats_block(2.0, true, &block) };
+    timer.setTolerance(1.0); // let macOS coalesce the wake-ups
+    ui(|u| u.watchdog = Some(timer));
+}
+
+fn watchdog() {
+    let trusted = sys::is_trusted(false);
+    with_app(|a| {
+        if !trusted {
+            a.tap.stop();
+        } else if a.tap.keep_alive() {
+            a.engine.start_new_session(); // keys typed meanwhile never reached the engine
+            a.tap.clear_sync();
         }
     });
-    let timer = unsafe { NSTimer::scheduledTimerWithTimeInterval_repeats_block(1.0, true, &block) };
-    ui(|u| u.access_timer = Some(timer));
+    let health = Health { no_permission: !trusted, secure_input: sys::secure_input_owner() };
+    if ui(|u| std::mem::replace(&mut u.health, health.clone()) != health) {
+        refresh();
+    }
+    let (cpu, memory) = sys::process_usage();
+    crate::stats::sample(cpu, memory);
+    update_activity();
 }
 
 fn register_notifications() {
@@ -613,6 +722,8 @@ pub fn refresh() {
             } else {
                 button.setTitle(&ns(if s.language == 1 { "V" } else { "E" }));
             }
+            // dimmed while keys cannot be processed (see the menu header for why)
+            button.setAppearsDisabled(u.health != Health::default());
         }
         let vietnamese = s.language == 1;
         if let Some(m) = &u.menu_switch {
@@ -625,7 +736,15 @@ pub fn refresh() {
         if let Some(t) = &u.menu_status {
             let code = CODE_TABLES.get(s.code_table as usize).copied().unwrap_or_default();
             let key = hotkey::describe(o.switch_key);
-            let line = if key.is_empty() { format!("{input} · {code}") } else { format!("{input} · {code} · {key}") };
+            let line = if u.health.no_permission {
+                "⚠ Chưa có quyền Trợ năng (Accessibility)".to_string()
+            } else if let Some(app) = &u.health.secure_input {
+                format!("⚠ {app} đang chặn bàn phím (Secure Input)")
+            } else if key.is_empty() {
+                format!("{input} · {code}")
+            } else {
+                format!("{input} · {code} · {key}")
+            };
             t.setStringValue(&ns(&line));
         }
         if let Some(m) = &u.menu_input_holder {
@@ -728,7 +847,8 @@ fn action(tag: isize, sender: &AnyObject) {
                 prefs::set_int(tg.key, if on { v | tg.bit } else { v & !tg.bit });
             }
             match tg.key {
-                "RunOnStartup" => sys::set_run_on_startup(on),
+                // turning it off while running as the agent waits for Quit (see applicationWillTerminate)
+                "RunOnStartup" if on || !sys::under_launch_agent() => sys::set_launch_agent(on),
                 "vShowIconOnDock" => set_dock_icon(on),
                 _ => {}
             }
@@ -765,7 +885,7 @@ fn reset_defaults() {
         }
     }
     set_popup_value(POP_CASE, 0);
-    sys::set_run_on_startup(true);
+    sys::set_launch_agent(true);
     set_dock_icon(false);
     reload();
 }
@@ -1163,7 +1283,7 @@ pub fn show_settings() {
     let w = 580.0;
     let mut root = Page::new(w);
     root.header("VKeyEngine", &format!("Bộ gõ tiếng Việt · phiên bản {}", version()));
-    let labels: Vec<Retained<NSString>> = ["Bộ gõ", "Gõ tắt", "Hệ thống"].iter().map(|s| ns(s)).collect();
+    let labels: Vec<Retained<NSString>> = ["Bộ gõ", "Gõ tắt", "Hệ thống", "Hoạt động"].iter().map(|s| ns(s)).collect();
     let seg = unsafe {
         NSSegmentedControl::segmentedControlWithLabels_trackingMode_target_action(
             &NSArray::from_retained_slice(&labels),
@@ -1179,7 +1299,7 @@ pub fn show_settings() {
     seg.setFrameOrigin(NSPoint::new(w - PAD - s.width, TITLEBAR + 4.0));
     root.add(&seg);
 
-    let build: [&dyn Fn(&mut Page); 3] = [
+    let build: [&dyn Fn(&mut Page); 4] = [
         &|p| {
             p.section("Bộ gõ");
             p.card(vec![
@@ -1209,6 +1329,26 @@ pub fn show_settings() {
             p.toggle_card(P_COMPAT);
             p.buttons(&[("Khôi phục mặc định", T_DEFAULTS)], &[("Thoát VKeyEngine", T_QUIT)], 0);
         },
+        &|p| {
+            p.section("CPU · 2 phút gần nhất");
+            let (cw, ch) = (p.w - 2.0 * PAD, 96.0);
+            let graph_card = card(PAD, p.y, cw, ch);
+            let graph = GraphView::new(rect(INSET, 8.0, cw - 2.0 * INSET, ch - 16.0));
+            if let Some(c) = graph_card.contentView() {
+                c.addSubview(&graph);
+            }
+            p.add(&graph_card);
+            p.y += ch;
+            ui(|u| u.cpu_graph = Some(graph));
+            let rows = |p: &mut Page, range: std::ops::Range<usize>| {
+                p.card(ACTIVITY_ROWS[range].iter().map(|&label| (label, activity_value())).collect());
+            };
+            p.section("Tài nguyên");
+            rows(p, 0..3);
+            p.section("Bộ gõ");
+            rows(p, 3..7);
+            p.note("Cập nhật mỗi 2 giây. Khi để không, VKeyEngine gần như không dùng CPU.");
+        },
     ];
     let top = root.y;
     let pages: Vec<_> = build
@@ -1236,6 +1376,7 @@ pub fn show_settings() {
 
 fn show_page(i: usize) {
     let Some((win, top, h)) = ui(|u| {
+        u.page = i;
         for (n, (v, _)) in u.pages.iter().enumerate() {
             v.setHidden(n != i);
         }
@@ -1244,6 +1385,64 @@ fn show_page(i: usize) {
         return;
     };
     resize_content(&win, win.contentView().map_or(0.0, |v| v.frame().size.width), top + h);
+    update_activity();
+}
+
+const ACTIVITY_PAGE: usize = 3;
+const ACTIVITY_ROWS: [&str; 7] = [
+    "Bộ nhớ (RAM)",
+    "CPU hiện tại",
+    "Thời gian chạy",
+    "Trạng thái",
+    "Số phím đã xử lý",
+    "Thời gian xử lý trung bình mỗi phím",
+    "Chậm nhất",
+];
+
+fn activity_value() -> Retained<NSView> {
+    let l = text("—", 13.0, false, true);
+    l.setAlignment(NSTextAlignment::Right);
+    l.setFrameSize(NSSize::new(230.0, 17.0));
+    ui(|u| u.activity_values.push(l.clone()));
+    Retained::into_super(Retained::into_super(l))
+}
+
+/// Fill the "Hoạt động" page, if it is on screen.
+fn update_activity() {
+    let Some((values, graph, health)) = ui(|u| {
+        let visible = u.page == ACTIVITY_PAGE && u.settings.as_ref().is_some_and(|w| w.isVisible());
+        visible.then(|| (u.activity_values.clone(), u.cpu_graph.clone(), u.health.clone()))
+    }) else {
+        return;
+    };
+    use crate::stats;
+    let s = stats::snapshot();
+    let vietnamese = read_settings().0.language == 1;
+    let status = if health.no_permission {
+        "⚠ Chưa có quyền Trợ năng".to_string()
+    } else if let Some(app) = &health.secure_input {
+        format!("⚠ Bị chặn bởi {app}")
+    } else if vietnamese {
+        "Đang hoạt động · Tiếng Việt".to_string()
+    } else {
+        "Đang hoạt động · Tiếng Anh".to_string()
+    };
+    let texts = [
+        stats::memory(s.memory),
+        stats::percent(s.cpu),
+        stats::duration(s.uptime),
+        status,
+        stats::thousands(s.keys),
+        stats::latency(s.avg_key),
+        stats::latency(s.max_key),
+    ];
+    for (l, t) in values.iter().zip(texts) {
+        l.setStringValue(&ns(&t));
+    }
+    if let Some(g) = graph {
+        *g.ivars().borrow_mut() = s.cpu_history;
+        g.setNeedsDisplay(true);
+    }
 }
 
 pub fn show_convert() {
@@ -1372,14 +1571,14 @@ pub fn show_macros() {
 fn reload_macro_rows() {
     let rows = with_app(|a| a.engine.macros.all()).unwrap_or_default();
     *delegate().ivars().rows.borrow_mut() = rows;
-    ui(|u| {
-        if let Some(t) = &u.macro_table {
-            t.reloadData();
-        }
-        if let Some(b) = &u.macro_add {
-            b.setTitle(&ns("Thêm"));
-        }
-    });
+    // reloadData may change the selection, which calls tableViewSelectionDidChange
+    let (table, add) = ui(|u| (u.macro_table.clone(), u.macro_add.clone()));
+    if let Some(t) = table {
+        t.reloadData();
+    }
+    if let Some(b) = add {
+        b.setTitle(&ns("Thêm"));
+    }
 }
 
 fn macro_fields() -> (String, String) {
@@ -1390,14 +1589,13 @@ fn macro_fields() -> (String, String) {
 }
 
 fn clear_macro_fields() {
-    ui(|u| {
-        for f in [&u.macro_name, &u.macro_content].into_iter().flatten() {
-            f.setStringValue(&ns(""));
-        }
-        if let (Some(w), Some(n)) = (&u.macros, &u.macro_name) {
-            w.makeFirstResponder(Some(n));
-        }
-    });
+    let (win, name, content) = ui(|u| (u.macros.clone(), u.macro_name.clone(), u.macro_content.clone()));
+    for f in [&name, &content].into_iter().flatten() {
+        f.setStringValue(&ns(""));
+    }
+    if let (Some(w), Some(n)) = (win, name) {
+        w.makeFirstResponder(Some(&n));
+    }
 }
 
 fn macro_add() {

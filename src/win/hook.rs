@@ -14,7 +14,7 @@ use super::{hotkey, ui, with_app, App};
 use crate::engine::{encode_output, is_double_code, Code, KeyEvent, KeyState, MAX_BUFF};
 use crate::tables::*;
 use std::cell::Cell;
-use std::sync::atomic::{AtomicIsize, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicIsize, AtomicU32, Ordering};
 use windows_sys::Win32::Foundation::*;
 use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows_sys::Win32::System::SystemInformation::GetTickCount;
@@ -58,6 +58,9 @@ static THREAD: AtomicU32 = AtomicU32::new(0);
 /// GetTickCount() of the last key seen by the keyboard hook, and by raw input
 static LAST_HOOK_KEY: AtomicU32 = AtomicU32::new(0);
 static LAST_RAW_KEY: AtomicU32 = AtomicU32::new(0);
+/// The foreground app runs elevated and we do not: Windows (UIPI) neither sends us its keys
+/// nor accepts the characters we send it.
+pub static FRONT_ELEVATED: AtomicBool = AtomicBool::new(false);
 
 thread_local! {
     static IN_HOOK: Cell<bool> = const { Cell::new(false) };
@@ -123,6 +126,9 @@ pub fn raw_key_seen() {
 /// again. Raw input is used as the reference because it does not depend on the hooks (the
 /// mouse hook may survive alone, so "any input seen" would hide a dead keyboard hook).
 pub fn check_alive() {
+    if FRONT_ELEVATED.load(Ordering::SeqCst) {
+        return; // keys of an elevated app never reach the hook: not a dead hook
+    }
     let (raw, hooked) = (LAST_RAW_KEY.load(Ordering::SeqCst), LAST_HOOK_KEY.load(Ordering::SeqCst));
     if raw.wrapping_sub(hooked) as i32 > 1000 {
         LAST_HOOK_KEY.store(raw, Ordering::SeqCst);
@@ -160,8 +166,16 @@ unsafe extern "system" fn keyboard_proc(code: i32, wparam: WPARAM, lparam: LPARA
     {
         return next();
     }
+    if FRONT_ELEVATED.load(Ordering::SeqCst) {
+        return next(); // whatever we send would be blocked, so leave the key alone
+    }
     let msg = wparam as u32;
-    if guarded(|a| handle_key(a, msg, k.vkCode as u16)).unwrap_or(false) {
+    let started = std::time::Instant::now();
+    let swallow = guarded(|a| handle_key(a, msg, k.vkCode as u16)).unwrap_or(false);
+    if msg == WM_KEYDOWN || msg == WM_SYSKEYDOWN {
+        crate::stats::record_key(started.elapsed());
+    }
+    if swallow {
         1
     } else {
         next()
@@ -193,15 +207,33 @@ unsafe extern "system" fn foreground_changed(
     _thread: u32,
     _time: u32,
 ) {
-    let Some(exe) = foreground_exe() else { return };
+    let Some((exe, elevated)) = foreground_app() else { return };
+    if FRONT_ELEVATED.swap(elevated, Ordering::SeqCst) != elevated {
+        ui::post_refresh(); // tray tooltip explains why typing does not work there
+    }
     if exe.eq_ignore_ascii_case("explorer.exe") {
         return;
     }
     guarded(|a| a.on_active_app_changed(exe));
 }
 
-/// Executable name of the foreground window's process.
-fn foreground_exe() -> Option<String> {
+/// Process token is elevated (an unreadable token counts as elevated).
+unsafe fn is_elevated(process: HANDLE) -> bool {
+    use windows_sys::Win32::Security::{GetTokenInformation, TokenElevation, TOKEN_ELEVATION, TOKEN_QUERY};
+    let mut token: HANDLE = std::ptr::null_mut();
+    if OpenProcessToken(process, TOKEN_QUERY, &mut token) == 0 {
+        return true;
+    }
+    let mut e = TOKEN_ELEVATION { TokenIsElevated: 0 };
+    let mut len = 0u32;
+    let ok = GetTokenInformation(token, TokenElevation, &mut e as *mut _ as _, size_of::<TOKEN_ELEVATION>() as u32, &mut len);
+    CloseHandle(token);
+    ok != 0 && e.TokenIsElevated != 0
+}
+
+/// Executable name of the foreground window's process, and whether it is out of our reach
+/// (elevated while we are not).
+fn foreground_app() -> Option<(String, bool)> {
     unsafe {
         let mut pid = 0u32;
         GetWindowThreadProcessId(GetForegroundWindow(), &mut pid);
@@ -215,9 +247,10 @@ fn foreground_exe() -> Option<String> {
         let mut buf = [0u16; 1024];
         let mut len = buf.len() as u32;
         let ok = QueryFullProcessImageNameW(process, PROCESS_NAME_WIN32, buf.as_mut_ptr(), &mut len) != 0;
+        let elevated = is_elevated(process) && !is_elevated(GetCurrentProcess());
         CloseHandle(process);
         let path = String::from_utf16_lossy(&buf[..len as usize]);
-        ok.then(|| path.rsplit('\\').next().unwrap_or_default().to_string())
+        ok.then(|| (path.rsplit('\\').next().unwrap_or_default().to_string(), elevated))
     }
 }
 

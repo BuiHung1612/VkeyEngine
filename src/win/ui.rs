@@ -19,6 +19,7 @@ use windows_sys::Win32::Graphics::GdiPlus::{
     FillModeAlternate, GdipAddPathArc, GdipClosePathFigure, GdipCreateFromHDC, GdipCreatePath, GdipCreatePen1, GdipCreateSolidFill,
     GdipDeleteBrush, GdipDeleteGraphics, GdipDeletePath, GdipDeletePen, GdipDrawPath, GdipFillEllipse, GdipFillPath,
     GdipSetSmoothingMode, GdiplusShutdown, GdiplusStartup, GdiplusStartupInput, GpBrush, GpGraphics, SmoothingModeAntiAlias, UnitPixel,
+    GdipDrawLines, GdipFillPolygon, PointF,
 };
 use windows_sys::Win32::System::DataExchange::*;
 use windows_sys::Win32::System::LibraryLoader::{GetModuleHandleW, GetProcAddress, LoadLibraryW};
@@ -339,6 +340,10 @@ enum Item {
     Segment { r: R, labels: &'static [&'static str], tag: isize },
     Record { r: R, tag: isize },
     Icon(R),
+    /// value of ACTIVITY_ROWS[n], filled at paint time
+    Stat { r: R, n: usize },
+    /// CPU history graph
+    Graph(R),
 }
 
 impl Item {
@@ -346,7 +351,8 @@ impl Item {
         match self {
             Item::Text { r, .. } | Item::Switch { r, .. } | Item::Mod { r, .. } | Item::Button { r, .. } => *r,
             Item::Segment { r, .. } | Item::Record { r, .. } => *r,
-            Item::Card(r) | Item::Line(r) | Item::Field(r) | Item::Icon(r) => *r,
+            Item::Card(r) | Item::Line(r) | Item::Field(r) | Item::Icon(r) | Item::Graph(r) => *r,
+            Item::Stat { r, .. } => *r,
         }
     }
 
@@ -365,6 +371,7 @@ enum Ctl {
     Switch(usize),
     Popup(usize, f32),
     Hotkey(u8, isize),
+    Stat(usize),
     Edit(isize, &'static str, f32),
 }
 
@@ -429,6 +436,10 @@ impl Page {
                     self.items.push(Item::Field(r));
                     self.natives.push((Native::Edit(*id, placeholder), R { x: r.x + 8.0, y: r.y + 5.0, w: r.w - 16.0, h: 18.0 }));
                     *ew
+                }
+                Ctl::Stat(n) => {
+                    self.items.push(Item::Stat { r: at(230.0, ROW_H), n: *n });
+                    230.0
                 }
                 Ctl::Hotkey(page, tag) => {
                     let mods: Vec<usize> = (0..TOGGLES.len())
@@ -586,19 +597,52 @@ fn card_brush() -> HBRUSH {
 
 // ---------------------------------------------------------------- startup
 
-/// One VKeyEngine per user session; a second launch opens the settings of the first.
+const RESTARTED_ARG: &str = "--restarted";
+
+/// One VKeyEngine per user session; a second launch opens the settings of the first. A copy
+/// started after a crash waits for the crashed one to be gone.
 pub fn acquire_single_instance() -> bool {
-    unsafe {
-        CreateMutexW(null(), 0, wide("Local\\VKeyEngine").as_ptr());
-        if GetLastError() == ERROR_ALREADY_EXISTS {
-            let other = FindWindowW(wide(MAIN_CLASS).as_ptr(), null());
-            if !other.is_null() {
-                PostMessageW(other, WM_SHOW_SETTINGS, 0, 0);
+    let tries = if std::env::args().any(|a| a == RESTARTED_ARG) { 50 } else { 1 };
+    for i in 0..tries {
+        unsafe {
+            if i > 0 {
+                std::thread::sleep(std::time::Duration::from_millis(100));
             }
-            return false;
+            let mutex = CreateMutexW(null(), 0, wide("Local\\VKeyEngine").as_ptr());
+            if GetLastError() != ERROR_ALREADY_EXISTS {
+                return true;
+            }
+            CloseHandle(mutex);
         }
     }
-    true
+    let other = unsafe { FindWindowW(wide(MAIN_CLASS).as_ptr(), null()) };
+    if !other.is_null() {
+        unsafe { PostMessageW(other, WM_SHOW_SETTINGS, 0, 0) };
+    }
+    false
+}
+
+/// Start again after a crash: a panic starts a new copy before the process aborts, and
+/// Windows Error Reporting restarts us after other crashes or a hang. Not when the crash
+/// comes within 10 s of starting, which would loop.
+fn restart_after_crash() {
+    let started = std::time::Instant::now();
+    let previous = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        previous(info);
+        if started.elapsed().as_secs() >= 10 {
+            if let Ok(exe) = std::env::current_exe() {
+                let _ = std::process::Command::new(exe).arg(RESTARTED_ARG).spawn();
+            }
+        }
+    }));
+    let arg = wide(RESTARTED_ARG);
+    unsafe {
+        windows_sys::Win32::System::Recovery::RegisterApplicationRestart(
+            arg.as_ptr(),
+            windows_sys::Win32::System::Recovery::RESTART_NO_PATCH | windows_sys::Win32::System::Recovery::RESTART_NO_REBOOT,
+        )
+    };
 }
 
 /// Dark context menus follow the system theme (uxtheme ordinals 135 / 136, used by Explorer).
@@ -618,6 +662,7 @@ unsafe fn allow_dark_menus() {
 }
 
 pub fn run_app() {
+    restart_after_crash();
     unsafe {
         SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
         let mut token = 0usize;
@@ -746,7 +791,12 @@ fn tray(message: NOTIFY_ICON_MESSAGE) {
             ..std::mem::zeroed()
         };
         let mode = if vietnamese { "Tiếng Việt" } else { "Tiếng Anh" };
-        copy_wide(&mut data.szTip, &format!("VKeyEngine · {mode} · {}", INPUT_TYPES[s.input_type as usize]));
+        let tip = if hook::FRONT_ELEVATED.load(Ordering::SeqCst) {
+            "VKeyEngine · ⚠ Ứng dụng này chạy quyền Admin: chạy VKeyEngine bằng quyền Admin để gõ được".to_string()
+        } else {
+            format!("VKeyEngine · {mode} · {}", INPUT_TYPES[s.input_type as usize])
+        };
+        copy_wide(&mut data.szTip, &tip);
         if Shell_NotifyIconW(message, &data) == 0 && message == NIM_MODIFY {
             Shell_NotifyIconW(NIM_ADD, &data);
         }
@@ -838,6 +888,13 @@ unsafe extern "system" fn main_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam
         }
         WM_TIMER if wparam == TIMER_HOOK => {
             hook::check_alive();
+            let (cpu, memory) = super::process_usage();
+            crate::stats::sample(cpu, memory);
+            for hwnd in all_windows() {
+                if with_win(hwnd, |w| w.kind == Kind::Settings && w.page == ACTIVITY_PAGE) == Some(true) {
+                    InvalidateRect(hwnd, null(), 0);
+                }
+            }
             0
         }
         WM_SETTINGCHANGE => {
@@ -945,7 +1002,7 @@ fn action(hwnd: HWND, tag: isize) {
         T_CLOSE => unsafe {
             DestroyWindow(hwnd);
         },
-        _ if (T_PAGE..T_PAGE + 3).contains(&tag) => show_page(hwnd, (tag - T_PAGE) as usize),
+        _ if (T_PAGE..T_PAGE + 4).contains(&tag) => show_page(hwnd, (tag - T_PAGE) as usize),
         _ if (T_TOGGLE..T_POPUP).contains(&tag) => {
             let Some(tg) = TOGGLES.get((tag - T_TOGGLE) as usize) else { return };
             if !toggle_enabled(tg) {
@@ -1078,7 +1135,7 @@ fn quick_convert(always_alert: bool) {
             return;
         }
         let text = clipboard_get(CF_UNICODETEXT as u32).map(|b| {
-            let units: Vec<u16> = b.chunks_exact(2).map(|c| u16::from_le_bytes([c[0], c[1]])).take_while(|&u| u != 0).collect();
+            let units: Vec<u16> = b.as_chunks::<2>().0.iter().map(|&c| u16::from_le_bytes(c)).take_while(|&u| u != 0).collect();
             convert(&String::from_utf16_lossy(&units), &o.convert)
         });
         let html = clipboard_get(html_format).and_then(|b| {
@@ -1112,7 +1169,8 @@ fn build(kind: Kind, page: usize) -> Page {
     match kind {
         Kind::Settings => {
             p.header("VKeyEngine", &format!("Bộ gõ tiếng Việt · phiên bản {}", env!("CARGO_PKG_VERSION")));
-            p.items.push(Item::Segment { r: R { x: 580.0 - PAD - 252.0, y: 28.0, w: 252.0, h: 30.0 }, labels: &["Bộ gõ", "Gõ tắt", "Hệ thống"], tag: T_PAGE });
+            let labels: &[&str] = &["Bộ gõ", "Gõ tắt", "Hệ thống", "Hoạt động"];
+            p.items.push(Item::Segment { r: R { x: 580.0 - PAD - 340.0, y: 28.0, w: 340.0, h: 30.0 }, labels, tag: T_PAGE });
             match page {
                 0 => {
                     let beep = toggle_index("vSwitchKeyStatus", hotkey::BEEP);
@@ -1134,6 +1192,18 @@ fn build(kind: Kind, page: usize) -> Page {
                     p.toggle_card(P_MACRO);
                     p.note("Ví dụ: gõ \"vn\" rồi nhấn phím cách để được \"Việt Nam\".");
                     p.buttons(&[], &[("Bảng gõ tắt…", T_MACROS)], 0);
+                }
+                ACTIVITY_PAGE => {
+                    p.section("CPU · 2 phút gần nhất");
+                    let r = R { x: PAD, y: p.y, w: p.w - 2.0 * PAD, h: 96.0 };
+                    p.items.push(Item::Card(r));
+                    p.items.push(Item::Graph(R { x: r.x + INSET, y: r.y + 8.0, w: r.w - 2.0 * INSET, h: r.h - 16.0 }));
+                    p.y += r.h;
+                    p.section("Tài nguyên");
+                    p.card((0..3).map(|n| (ACTIVITY_ROWS[n], Ctl::Stat(n))).collect());
+                    p.section("Bộ gõ");
+                    p.card((3..7).map(|n| (ACTIVITY_ROWS[n], Ctl::Stat(n))).collect());
+                    p.note("Cập nhật mỗi 2 giây. Khi để không, VKeyEngine gần như không dùng CPU.");
                 }
                 _ => {
                     p.section("Khởi động");
@@ -1203,6 +1273,38 @@ fn build(kind: Kind, page: usize) -> Page {
     }
     p.finish();
     p
+}
+
+const ACTIVITY_PAGE: usize = 3;
+const ACTIVITY_ROWS: [&str; 7] = [
+    "Bộ nhớ (RAM)",
+    "CPU hiện tại",
+    "Thời gian chạy",
+    "Trạng thái",
+    "Số phím đã xử lý",
+    "Thời gian xử lý trung bình mỗi phím",
+    "Chậm nhất",
+];
+
+fn activity_texts() -> [String; 7] {
+    use crate::stats;
+    let s = stats::snapshot();
+    let status = if hook::FRONT_ELEVATED.load(Ordering::SeqCst) {
+        "⚠ Ứng dụng quyền Admin đang mở".to_string()
+    } else if read_settings().0.language == 1 {
+        "Đang hoạt động · Tiếng Việt".to_string()
+    } else {
+        "Đang hoạt động · Tiếng Anh".to_string()
+    };
+    [
+        stats::memory(s.memory),
+        stats::percent(s.cpu),
+        stats::duration(s.uptime),
+        status,
+        stats::thousands(s.keys),
+        stats::latency(s.avg_key),
+        stats::latency(s.max_key),
+    ]
 }
 
 fn title(kind: Kind) -> &'static str {
@@ -1522,6 +1624,31 @@ fn paint(hwnd: HWND) {
                     let fill = if recording == Some(*tag) || hot { t.hover } else { t.button };
                     g.rounded(*r, 6.0, s, Some(argb(fill, 255)), None);
                 }
+                Item::Graph(r) => {
+                    let values = crate::stats::snapshot().cpu_history;
+                    if values.len() >= 2 {
+                        let max = values.iter().fold(5.0f32, |m, &v| m.max(v)); // at least 5 % full scale
+                        let step = r.w / (crate::stats::HISTORY - 1) as f32;
+                        let x0 = r.x + r.w - step * (values.len() - 1) as f32; // newest on the right
+                        let bottom = r.y + r.h;
+                        let mut pts: Vec<PointF> = values
+                            .iter()
+                            .enumerate()
+                            .map(|(i, &v)| PointF { X: (x0 + step * i as f32) * s, Y: (bottom - 4.0 - (r.h - 8.0) * v / max) * s })
+                            .collect();
+                        let line = pts.clone();
+                        pts.push(PointF { X: (r.x + r.w) * s, Y: bottom * s });
+                        pts.push(PointF { X: x0 * s, Y: bottom * s });
+                        let mut brush = null_mut();
+                        GdipCreateSolidFill(argb(t.text, 26), &mut brush);
+                        GdipFillPolygon(g.0, brush as *mut GpBrush, pts.as_ptr(), pts.len() as i32, FillModeAlternate);
+                        GdipDeleteBrush(brush as *mut GpBrush);
+                        let mut pen = null_mut();
+                        GdipCreatePen1(argb(t.text, 255), 1.5 * s, UnitPixel, &mut pen);
+                        GdipDrawLines(g.0, pen, line.as_ptr(), line.len() as i32);
+                        GdipDeletePen(pen);
+                    }
+                }
                 Item::Segment { r, labels, .. } => {
                     g.rounded(*r, 8.0, s, Some(argb(t.button, 255)), None);
                     let sw = r.w / labels.len() as f32;
@@ -1540,7 +1667,7 @@ fn paint(hwnd: HWND) {
 
         // text and icons
         SetBkMode(mem, TRANSPARENT as i32);
-        let draw = |r: R, text: &str, px: f32, bold: bool, color: u32, center: bool| {
+        let draw = |r: R, text: &str, px: f32, bold: bool, color: u32, align: DRAW_TEXT_FORMAT| {
             let mut rect = RECT {
                 left: (r.x * s) as i32,
                 top: (r.y * s) as i32,
@@ -1550,9 +1677,9 @@ fn paint(hwnd: HWND) {
             SelectObject(mem, font(px, bold, s));
             SetTextColor(mem, colorref(color));
             let mut w: Vec<u16> = text.encode_utf16().collect();
-            let align = if center { DT_CENTER } else { DT_LEFT };
             DrawTextW(mem, w.as_mut_ptr(), w.len() as i32, &mut rect, DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS | DT_NOPREFIX | align);
         };
+        let mut activity: Option<[String; 7]> = None; // computed once per paint
         for item in &items {
             match item {
                 Item::Text { r, s: text, size, bold, secondary, center, toggle } => {
@@ -1560,30 +1687,34 @@ fn paint(hwnd: HWND) {
                     if toggle.is_some_and(|i| !toggle_enabled(&TOGGLES[i])) {
                         color = blend(t.text, t.card, 0.6);
                     }
-                    draw(*r, text, *size, *bold, color, *center)
+                    draw(*r, text, *size, *bold, color, if *center { DT_CENTER } else { DT_LEFT })
                 }
                 Item::Mod { r, toggle } => {
                     let tg = &TOGGLES[*toggle];
                     let color = if toggle_on(tg) { t.on_accent } else { t.text };
-                    draw(*r, tg.title, 12.0, false, color, true);
+                    draw(*r, tg.title, 12.0, false, color, DT_CENTER);
                 }
                 Item::Button { r, label, tag, primary } => {
                     let color = if *primary { t.on_accent } else { t.text };
-                    draw(*r, &button_label(hwnd, *tag, label), 13.0, *primary, color, true);
+                    draw(*r, &button_label(hwnd, *tag, label), 13.0, *primary, color, DT_CENTER);
                 }
                 Item::Record { r, tag } => {
                     let key = if *tag == T_RECORD_SWITCH { "vSwitchKeyStatus" } else { "convertToolHotKey" };
                     let default = if *tag == T_RECORD_SWITCH { DEFAULT_SWITCH_KEY } else { EMPTY_HOTKEY };
                     let label = if recording == Some(*tag) { "Nhấn một phím…".to_string() } else { hotkey::key_title(int_pref(key, default)) };
-                    draw(*r, &label, 12.0, false, t.text, true);
+                    draw(*r, &label, 12.0, false, t.text, DT_CENTER);
                 }
                 Item::Segment { r, labels, .. } => {
                     let sw = r.w / labels.len() as f32;
                     for (n, label) in labels.iter().enumerate() {
                         let seg = R { x: r.x + sw * n as f32, y: r.y, w: sw, h: r.h };
                         let color = if n == page { t.on_accent } else { t.text };
-                        draw(seg, label, 13.0, n == page, color, true);
+                        draw(seg, label, 13.0, n == page, color, DT_CENTER);
                     }
+                }
+                Item::Stat { r, n } => {
+                    let texts = activity.get_or_insert_with(activity_texts);
+                    draw(*r, &texts[*n], 13.0, false, t.secondary, DT_RIGHT);
                 }
                 Item::Icon(r) => {
                     let size = (r.w * s) as i32;

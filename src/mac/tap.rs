@@ -69,6 +69,12 @@ fn has(flags: u64, f: CGEventFlags) -> bool {
     flags & f.0 != 0
 }
 
+impl Default for Tap {
+    fn default() -> Tap {
+        Tap::new()
+    }
+}
+
 impl Tap {
     pub fn new() -> Tap {
         let source = CGEventSource::new(CGEventSourceStateID::Private);
@@ -136,6 +142,24 @@ impl Tap {
         if let Some(port) = self.port.take() {
             port.invalidate();
         }
+    }
+
+    /// Start the tap if it is not running, re-create it if its port died, re-enable it if
+    /// macOS disabled it without telling us. Returns true if it had to repair something.
+    pub fn keep_alive(&mut self) -> bool {
+        let (dead, disabled) = match &self.port {
+            None => (true, false),
+            Some(p) => (!p.is_valid(), !CGEvent::tap_is_enabled(p)),
+        };
+        if dead {
+            self.stop();
+            self.start();
+        } else if disabled {
+            if let Some(p) = &self.port {
+                CGEvent::tap_enable(p, true);
+            }
+        }
+        dead || disabled
     }
 
     pub fn clear_sync(&mut self) {
@@ -290,7 +314,11 @@ unsafe extern "C-unwind" fn callback(
         return event.as_ptr();
     }
     let ev = unsafe { event.as_ref() };
+    let started = std::time::Instant::now();
     let outcome = with_app(|app| handle(app, _proxy, ty, ev)).unwrap_or(Outcome::Pass);
+    if ty == CGEventType::KeyDown {
+        crate::stats::record_key(started.elapsed());
+    }
     match outcome {
         Outcome::Pass => event.as_ptr(),
         Outcome::Swallow => std::ptr::null_mut(),
