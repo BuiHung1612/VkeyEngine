@@ -589,6 +589,7 @@ fn watchdog() {
         ui(|u| u.health.other_ime.clone())
     };
     let health = Health { no_permission: !trusted, secure_input: sys::secure_input_owner(), other_ime };
+    check_stuck_secure_input(health.secure_input.is_some());
     if ui(|u| std::mem::replace(&mut u.health, health.clone()) != health) {
         refresh();
     }
@@ -604,6 +605,39 @@ fn watchdog() {
         save_typing_stats(); // once a minute, only if something changed
     }
     update_activity();
+}
+
+/// Secure Input left on (Chrome sometimes keeps it after the password field is gone): the
+/// dimmed icon is easy to miss, so once per episode, when it has lasted 30 s and keys are
+/// being pressed that never reach us, say why and offer to quit the app holding it.
+fn check_stuck_secure_input(on: bool) {
+    use std::time::{Duration, Instant};
+    thread_local! {
+        /// since when Secure Input is on, and whether we already warned
+        static EPISODE: std::cell::Cell<Option<(Instant, bool)>> = const { std::cell::Cell::new(None) };
+    }
+    if !on {
+        EPISODE.set(None);
+        return;
+    }
+    let (since, warned) = EPISODE.get().unwrap_or((Instant::now(), false));
+    let fire = !warned && since.elapsed() >= Duration::from_secs(30) && sys::seconds_since_key() < 3.0;
+    EPISODE.set(Some((since, warned || fire)));
+    if fire {
+        defer(warn_secure_input);
+    }
+}
+
+fn warn_secure_input() {
+    let Some(app) = sys::secure_input_app() else { return }; // released meanwhile
+    let name = app.localizedName().map_or_else(|| "Một ứng dụng".into(), |s| s.to_string());
+    let help = secure_input_help(&name);
+    // only offer to quit ordinary apps: never loginwindow (log out) or background processes
+    if app.activationPolicy() != NSApplicationActivationPolicy::Regular {
+        alert("Không gõ được tiếng Việt?", &help);
+    } else if ask("Không gõ được tiếng Việt?", &help, &format!("Thoát {name}"), "Để sau") {
+        app.terminate();
+    }
 }
 
 fn save_typing_stats() {

@@ -191,15 +191,27 @@ pub fn secure_input_owner() -> Option<String> {
     if !unsafe { IsSecureEventInputEnabled() } {
         return None;
     }
-    let name = (|| {
-        let session = objc2_core_graphics::CGSessionCopyCurrentDictionary()?;
-        let session: &NSDictionary<NSString, AnyObject> =
-            unsafe { &*(objc2_core_foundation::CFRetained::as_ptr(&session).as_ptr() as *const _) };
-        let pid = session.objectForKey(&NSString::from_str("kCGSSessionSecureInputPID"))?.downcast::<NSNumber>().ok()?;
-        let app = objc2_app_kit::NSRunningApplication::runningApplicationWithProcessIdentifier(pid.intValue())?;
-        app.localizedName().map(|s| s.to_string())
-    })();
+    let name = secure_input_app().and_then(|app| app.localizedName()).map(|s| s.to_string());
     Some(name.unwrap_or_else(|| "Một ứng dụng".into()))
+}
+
+/// The app that turned Secure Input on, if it is on and the app can be found.
+pub fn secure_input_app() -> Option<Retained<objc2_app_kit::NSRunningApplication>> {
+    if !unsafe { IsSecureEventInputEnabled() } {
+        return None;
+    }
+    let session = objc2_core_graphics::CGSessionCopyCurrentDictionary()?;
+    let session: &NSDictionary<NSString, AnyObject> =
+        unsafe { &*(objc2_core_foundation::CFRetained::as_ptr(&session).as_ptr() as *const _) };
+    let pid = session.objectForKey(&NSString::from_str("kCGSSessionSecureInputPID"))?.downcast::<NSNumber>().ok()?;
+    objc2_app_kit::NSRunningApplication::runningApplicationWithProcessIdentifier(pid.intValue())
+}
+
+/// Seconds since the last key press anywhere, read from the keyboard hardware state: it
+/// moves even while Secure Input keeps the keys away from us.
+pub fn seconds_since_key() -> f64 {
+    use objc2_core_graphics::{CGEventSource, CGEventSourceStateID, CGEventType};
+    CGEventSource::seconds_since_last_event_type(CGEventSourceStateID::HIDSystemState, CGEventType::KeyDown)
 }
 
 /// Spotlight search panel is on screen (it is not the frontmost app, so check windows).
