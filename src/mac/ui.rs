@@ -792,7 +792,7 @@ pub fn refresh() {
             let line = if u.health.no_permission {
                 "⚠ Chưa có quyền Trợ năng (Accessibility)".to_string()
             } else if let Some(app) = &u.health.secure_input {
-                format!("⚠ {app} đang chặn bàn phím (Secure Input)")
+                format!("⚠ {app}: ô mật khẩu chặn gõ")
             } else if !u.health.other_ime.is_empty() {
                 format!("⚠ {} cũng đang chạy: nên tắt", u.health.other_ime.join(", "))
             } else if excluded {
@@ -803,6 +803,8 @@ pub fn refresh() {
                 format!("{input} · {code} · {key}")
             };
             t.setStringValue(&ns(&line));
+            let tip = u.health.secure_input.as_deref().map(secure_input_help);
+            t.setToolTip(tip.as_deref().map(ns).as_deref());
         }
         if let Some(m) = &u.menu_input_holder {
             m.setTitle(&ns(&format!("Kiểu gõ: {input}")));
@@ -1090,6 +1092,16 @@ fn ask(msg: &str, info: &str, yes: &str, no: &str) -> bool {
 
 // ---------------------------------------------------------------- "Tôi gõ không được"
 
+/// Why Secure Input stops typing, in words for people who never heard of it.
+fn secure_input_help(app: &str) -> String {
+    format!(
+        "{app} đang bật chế độ bảo vệ mật khẩu (Secure Input), thường do một ô nhập mật khẩu đang được chọn. \
+         Trong lúc đó macOS không cho bộ gõ nào nhận phím, để không phần mềm nào đọc lén được mật khẩu.\n\n\
+         Cách sửa: bấm ra khỏi ô mật khẩu hoặc đóng trang đăng nhập. Nếu vẫn không gõ được, {app} bị kẹt chế độ này: \
+         thoát hẳn {app} (⌘Q) rồi mở lại."
+    )
+}
+
 /// Check what usually stops typing, and say how to fix each problem found.
 fn diagnose() {
     let (s, o) = read_settings();
@@ -1101,9 +1113,7 @@ fn diagnose() {
         issues.push("Bộ gõ chưa chạy. VKeyEngine sẽ tự bật lại trong vài giây.".into());
     }
     if let Some(app) = sys::secure_input_owner() {
-        issues.push(format!(
-            "{app} đang bật Secure Input (ô mật khẩu, hoặc Terminal → Secure Keyboard Entry): macOS không gửi phím cho bộ gõ nào. Đóng ô mật khẩu hoặc tắt chế độ đó."
-        ));
+        issues.push(secure_input_help(&app));
     }
     let others = sys::other_input_methods();
     if !others.is_empty() {
