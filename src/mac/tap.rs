@@ -49,6 +49,18 @@ const MAX_UNITS_PER_EVENT: usize = 16;
 thread_local! {
     /// The running tap, reachable without borrowing the app state (see `callback`).
     static PORT: std::cell::RefCell<Option<CFRetained<CFMachPort>>> = const { std::cell::RefCell::new(None) };
+    /// when the tap last saw a key press
+    static LAST_KEY: std::cell::Cell<Option<std::time::Instant>> = const { std::cell::Cell::new(None) };
+}
+
+/// Seconds since the tap last saw a key press (counted from the first call before any).
+pub fn seconds_since_key() -> f64 {
+    let at = LAST_KEY.get().unwrap_or_else(|| {
+        let now = std::time::Instant::now();
+        LAST_KEY.set(Some(now));
+        now
+    });
+    at.elapsed().as_secs_f64()
 }
 
 pub struct Tap {
@@ -326,6 +338,9 @@ unsafe extern "C-unwind" fn callback(
     }
     let ev = unsafe { event.as_ref() };
     let started = std::time::Instant::now();
+    if ty == CGEventType::KeyDown {
+        LAST_KEY.set(Some(started));
+    }
     let outcome = with_app(|app| handle(app, _proxy, ty, ev)).unwrap_or(Outcome::Pass);
     if ty == CGEventType::KeyDown {
         crate::stats::record_key(started.elapsed());

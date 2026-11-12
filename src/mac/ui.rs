@@ -588,8 +588,7 @@ fn watchdog() {
     } else {
         ui(|u| u.health.other_ime.clone())
     };
-    let health = Health { no_permission: !trusted, secure_input: sys::secure_input_owner(), other_ime };
-    check_stuck_secure_input(health.secure_input.is_some());
+    let health = Health { no_permission: !trusted, secure_input: secure_input_block(), other_ime };
     if ui(|u| std::mem::replace(&mut u.health, health.clone()) != health) {
         refresh();
     }
@@ -607,25 +606,31 @@ fn watchdog() {
     update_activity();
 }
 
-/// Secure Input left on (Chrome sometimes keeps it after the password field is gone): the
-/// dimmed icon is easy to miss, so once per episode, when it has lasted 30 s and keys are
-/// being pressed that never reach us, say why and offer to quit the app holding it.
-fn check_stuck_secure_input(on: bool) {
+/// The app whose Secure Input keeps keys away from us. Secure Input being on is not enough:
+/// apps often leave it on (Orca, Chrome...) while we still get every key, so it counts only
+/// once a key pressed on the keyboard never reached the tap, and stays until the tap sees a
+/// key again or Secure Input goes off. The dimmed icon is easy to miss: once per episode,
+/// after 15 s while keys are still being pressed, say why and offer to quit that app.
+fn secure_input_block() -> Option<String> {
     use std::time::{Duration, Instant};
     thread_local! {
-        /// since when Secure Input is on, and whether we already warned
-        static EPISODE: std::cell::Cell<Option<(Instant, bool)>> = const { std::cell::Cell::new(None) };
+        /// since when keys are blocked, and whether we already warned
+        static BLOCKED: std::cell::Cell<Option<(Instant, bool)>> = const { std::cell::Cell::new(None) };
     }
-    if !on {
-        EPISODE.set(None);
-        return;
+    let owner = sys::secure_input_owner();
+    let keyboard = sys::seconds_since_key();
+    let missed = crate::mac::tap::seconds_since_key() > keyboard + 1.0;
+    if owner.is_none() || !missed {
+        BLOCKED.set(None);
+        return None;
     }
-    let (since, warned) = EPISODE.get().unwrap_or((Instant::now(), false));
-    let fire = !warned && since.elapsed() >= Duration::from_secs(30) && sys::seconds_since_key() < 3.0;
-    EPISODE.set(Some((since, warned || fire)));
+    let (since, warned) = BLOCKED.get().unwrap_or((Instant::now(), false));
+    let fire = !warned && since.elapsed() >= Duration::from_secs(15) && keyboard < 3.0;
+    BLOCKED.set(Some((since, warned || fire)));
     if fire {
         defer(warn_secure_input);
     }
+    owner
 }
 
 fn warn_secure_input() {
@@ -1146,7 +1151,7 @@ fn diagnose() {
     } else if !with_app(|a| a.tap.is_running()).unwrap_or(false) {
         issues.push("Bộ gõ chưa chạy. VKeyEngine sẽ tự bật lại trong vài giây.".into());
     }
-    if let Some(app) = sys::secure_input_owner() {
+    if let Some(app) = ui(|u| u.health.secure_input.clone()) {
         issues.push(secure_input_help(&app));
     }
     let others = sys::other_input_methods();
