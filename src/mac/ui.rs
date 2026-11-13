@@ -305,7 +305,15 @@ define_class!(
 
         #[unsafe(method(appActivated:))]
         fn app_activated(&self, _n: &NSNotification) {
-            with_app(|a| a.on_active_app_changed());
+            // our own windows coming to the front leave front_app as it was: no badge then
+            let changed = with_app(|a| {
+                let before = a.front_app.clone();
+                a.on_active_app_changed();
+                a.front_app != before && a.in_remote()
+            });
+            if changed.unwrap_or(false) {
+                show_hud(Some(crate::exclude::REMOTE_NOTE));
+            }
             refresh(); // the "Không gõ tiếng Việt trong …" item names the new app
         }
 
@@ -799,7 +807,7 @@ fn on_off(b: bool) -> isize {
 pub fn refresh() {
     let (s, o) = read_settings();
     let (excluded, front_name, excluded_names) = with_app(|a| {
-        let names: Vec<String> = a.excluded.iter().map(|id| sys::app_name(id)).collect();
+        let names: Vec<String> = crate::exclude::shown(&a.excluded).map(|id| sys::app_name(id)).collect();
         (a.front_excluded(), a.front_name.clone(), names)
     })
     .unwrap_or_default();
@@ -2243,9 +2251,17 @@ fn hud() -> (Retained<NSPanel>, Retained<NSTextField>) {
 /// Briefly show V or E next to the text caret (or the mouse pointer when the app does not
 /// say where its caret is), then fade out.
 pub fn show_mode_hud() {
+    show_hud(None);
+}
+
+/// The badge with `note` instead of V / E, widened to fit it.
+pub fn show_hud(note: Option<&str>) {
     let mtm = mtm();
     let (panel, label) = hud();
-    label.setStringValue(&ns(if read_settings().0.language == 1 { "V" } else { "E" }));
+    label.setStringValue(&ns(note.unwrap_or(if read_settings().0.language == 1 { "V" } else { "E" })));
+    let w = if note.is_some() { label.fittingSize().width.ceil() + 20.0 } else { HUD_W };
+    panel.setContentSize(NSSize::new(w, HUD_H));
+    label.setFrame(rect(0.0, (HUD_H - 19.0) / 2.0, w, 19.0));
     let origin = match sys::caret_rect() {
         Some((x, y, w, h)) => {
             // Accessibility: origin at the top left of the main screen; AppKit: bottom left

@@ -773,6 +773,11 @@ pub fn post_mode_hud() {
     unsafe { PostMessageW(main_hwnd(), WM_MODE_HUD, 0, 0) };
 }
 
+/// The badge says we stay out of the remote desktop client in front.
+pub fn post_remote_hud() {
+    unsafe { PostMessageW(main_hwnd(), WM_MODE_HUD, 1, 0) };
+}
+
 pub fn post_quick_convert() {
     unsafe { PostMessageW(main_hwnd(), WM_QUICK_CONVERT, 0, 0) };
 }
@@ -948,7 +953,7 @@ unsafe extern "system" fn main_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam
             0
         }
         WM_MODE_HUD => {
-            show_mode_hud();
+            show_mode_hud((wparam == 1).then_some(crate::exclude::REMOTE_NOTE));
             0
         }
         WM_TIMER if wparam == TIMER_SELECTION => {
@@ -2096,7 +2101,7 @@ fn paint(hwnd: HWND) {
                     }
                 }
                 Item::Stat { r, n } if *n == STAT_EXCLUDED => {
-                    let names = with_app(|a| a.excluded.iter().map(|e| e.trim_end_matches(".exe").to_string()).collect::<Vec<_>>().join(", "))
+                    let names = with_app(|a| crate::exclude::shown(&a.excluded).map(|e| e.trim_end_matches(".exe").to_string()).collect::<Vec<_>>().join(", "))
                         .unwrap_or_default();
                     draw(*r, if names.is_empty() { "Chưa có" } else { &names }, 13.0, false, t.secondary, DT_RIGHT);
                 }
@@ -2608,8 +2613,8 @@ thread_local! {
 }
 
 /// Briefly show V or E next to the text caret (or the mouse pointer when the app does not
-/// say where its caret is), then fade out.
-fn show_mode_hud() {
+/// say where its caret is), then fade out. With `note`: that text, the badge widened to fit.
+fn show_mode_hud(note: Option<&'static str>) {
     unsafe {
         let mut hwnd = HUD.with(|h| h.borrow().0);
         if hwnd.is_null() {
@@ -2618,7 +2623,20 @@ fn show_mode_hud() {
             HUD.with(|h| h.borrow_mut().0 = hwnd);
         }
         let s = scale(hwnd);
-        let (w, h) = ((HUD_W * s) as i32, (HUD_H * s) as i32);
+        let text = note.unwrap_or(if read_settings().0.language == 1 { "V" } else { "E" });
+        let h = (HUD_H * s) as i32;
+        let w = match note {
+            None => (HUD_W * s) as i32,
+            Some(n) => {
+                let hdc = GetDC(hwnd);
+                SelectObject(hdc, font(15.0, true, s));
+                let mut rc = RECT { left: 0, top: 0, right: 0, bottom: 0 };
+                let mut t: Vec<u16> = n.encode_utf16().collect();
+                DrawTextW(hdc, t.as_mut_ptr(), t.len() as i32, &mut rc, DT_SINGLELINE | DT_CALCRECT | DT_NOPREFIX);
+                ReleaseDC(hwnd, hdc);
+                rc.right + (20.0 * s) as i32
+            }
+        };
         let mut info = GUITHREADINFO { cbSize: size_of::<GUITHREADINFO>() as u32, ..std::mem::zeroed() };
         let thread = GetWindowThreadProcessId(GetForegroundWindow(), null_mut());
         let mut at = POINT { x: 0, y: 0 };
@@ -2631,7 +2649,6 @@ fn show_mode_hud() {
             GetCursorPos(&mut at);
             at = POINT { x: at.x + (14.0 * s) as i32, y: at.y + (18.0 * s) as i32 };
         }
-        let text = if read_settings().0.language == 1 { "V" } else { "E" };
         HUD.with(|hud| {
             let mut hud = hud.borrow_mut();
             (hud.1, hud.2, hud.3) = (text, 0, 255);

@@ -218,6 +218,9 @@ unsafe extern "system" fn foreground_changed(
         return;
     }
     guarded(|a| a.on_active_app_changed(exe));
+    if guarded(|a| a.in_remote()).unwrap_or(false) {
+        ui::post_remote_hud();
+    }
     ui::post_refresh(); // tray icon and menu follow the app (excluded, elevated)
 }
 

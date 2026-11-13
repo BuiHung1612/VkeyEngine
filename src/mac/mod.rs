@@ -185,7 +185,12 @@ impl App {
 
     /// Keys go through untouched in the frontmost app (it is in the exclusion list).
     pub fn front_excluded(&self) -> bool {
-        self.excluded.contains(&self.front_app)
+        crate::exclude::is_excluded(&self.excluded, &self.front_app)
+    }
+
+    /// Vietnamese is on but the front app is a remote desktop client we stay out of.
+    pub fn in_remote(&self) -> bool {
+        self.engine.s.language == 1 && crate::exclude::is_remote(&self.front_app) && self.front_excluded()
     }
 
     /// Add or remove the frontmost app from the exclusion list.
@@ -193,11 +198,7 @@ impl App {
         if self.front_app.is_empty() {
             return;
         }
-        if self.front_excluded() {
-            self.excluded.retain(|a| *a != self.front_app);
-        } else {
-            self.excluded.push(self.front_app.clone());
-        }
+        crate::exclude::toggle(&mut self.excluded, &self.front_app);
         self.save_excluded();
         self.engine.start_new_session();
         self.tap.clear_sync();

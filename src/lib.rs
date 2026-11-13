@@ -2,6 +2,7 @@
 
 pub mod convert;
 pub mod engine;
+pub mod exclude;
 pub mod macros;
 #[doc(hidden)]
 pub mod sim;
