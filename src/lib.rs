@@ -4,6 +4,7 @@ pub mod convert;
 pub mod engine;
 pub mod exclude;
 pub mod macros;
+pub mod output;
 #[doc(hidden)]
 pub mod sim;
 pub mod smart_switch;

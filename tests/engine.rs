@@ -2,7 +2,8 @@ use vkeyengine::convert::{convert, ConvertOptions};
 use vkeyengine::engine::*;
 
 
-use vkeyengine::sim::type_with;
+use vkeyengine::output::{BrowserFix, Ctx};
+use vkeyengine::sim::{type_with, type_with_ctx};
 use vkeyengine::tables::key_to_char;
 
 fn typ(input: &str) -> String {
@@ -271,4 +272,82 @@ fn macro_packs_add_free_names_only() {
     e.macros.add_pack(&PACKS[1], 0);
     assert_eq!(type_with(&mut e, ":) "), "😊 ");
     assert_eq!(type_with(&mut e, "-> "), "→ ");
+}
+
+fn in_table(table: u8, input: &str) -> String {
+    let mut e = Engine::new(Settings { code_table: table, ..Settings::default() });
+    type_with(&mut e, input)
+}
+
+#[test]
+fn space_after_backspace_keeps_two_unit_characters_whole() {
+    // VNI Windows / Unicode Compound / CP 1258: "việt", Backspace, Space deleted half of "ệ"
+    for table in 2..=4 {
+        let expected = in_table(table, "vieejt").encode_utf16().collect::<Vec<_>>();
+        let mut expected = String::from_utf16(&expected[..expected.len() - 1]).unwrap();
+        expected.push(' ');
+        assert_eq!(in_table(table, "vieejt\x08 "), expected, "table {table}");
+    }
+}
+
+#[test]
+fn backspace_deletes_whole_two_unit_characters() {
+    for table in 2..=4 {
+        assert_eq!(in_table(table, "vieejt\x08\x08"), in_table(table, "vi"), "table {table}");
+        assert_eq!(in_table(table, "tieengs vieejt\x08\x08\x08\x08\x08"), in_table(table, "tieengs"), "table {table}");
+    }
+}
+
+#[test]
+fn macro_trigger_key_is_tracked() {
+    // after a macro ending with a 2-unit character, Backspace over the space deleted half of it
+    for table in 2..=4 {
+        let s = Settings { code_table: table, ..Settings::default() };
+        let full = type_with(&mut macro_engine(s.clone(), &[("vv", "việ")]), "vv ");
+        let after = type_with(&mut macro_engine(s, &[("vv", "việ")]), "vv \x08");
+        assert_eq!(format!("{after} "), full, "table {table}");
+    }
+}
+
+#[test]
+fn focus_change_forgets_the_previous_word() {
+    // typed in app A, then Backspace + "s" in app B rewrote B's text as "iết"
+    let mut e = Engine::default();
+    assert_eq!(type_with(&mut e, "viet \x02\x08s"), "viets");
+    // a macro typed in app A fired in app B
+    let mut e = macro_engine(Settings::default(), &[("vn", "Việt Nam")]);
+    assert_eq!(type_with(&mut e, "vn\x02 "), "vn ");
+}
+
+#[test]
+fn click_after_english_word_starts_a_new_word() {
+    let s = Settings { restore_english: true, ..Settings::default() };
+    // the sim asserts that the click itself rewrites nothing
+    assert_eq!(type_with(&mut Engine::new(s.clone()), "boss\x01as"), format!("{}á", typ_s(s, "boss")));
+}
+
+#[test]
+fn chromium_select_fix_types_the_same_text() {
+    let ctx = Ctx { browser_fix: BrowserFix::SelectLeft, ..Ctx::default() };
+    for table in 0..=4 {
+        for input in ["tieengs vieejt", "dduwowcj nguwowif", "vieejt\x08\x08\x08ieejt", "khoong\x08\x08ng", "vieetj dduwowcj\x08\x08\x08\x08\x08"] {
+            let s = Settings { code_table: table, ..Settings::default() };
+            assert_eq!(
+                type_with_ctx(&mut Engine::new(s.clone()), input, &ctx),
+                type_with(&mut Engine::new(s), input),
+                "table {table}, {input:?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn empty_char_fix_types_the_same_text() {
+    // the invisible character stays in front of the word, the rest must match
+    let ctx = Ctx { browser_fix: BrowserFix::EmptyChar, ..Ctx::default() };
+    for table in 0..=4 {
+        let s = Settings { code_table: table, ..Settings::default() };
+        let got = type_with_ctx(&mut Engine::new(s.clone()), "vieejt\x08\x08ieet", &ctx).replace('\u{202F}', "");
+        assert_eq!(got, type_with(&mut Engine::new(s), "vieejt\x08\x08ieet"), "table {table}");
+    }
 }

@@ -809,8 +809,7 @@ fn app_icon(size: i32) -> HICON {
 }
 
 /// Black glyph on a light taskbar, white on a dark one.
-fn tray_icon(vietnamese: bool, size: i32) -> HICON {
-    let light = personalize("SystemUsesLightTheme", false);
+fn tray_icon(vietnamese: bool, light: bool, size: i32) -> HICON {
     let ico: &[u8] = match (vietnamese, light) {
         (true, true) => include_bytes!("../../windows/tray-v-black.ico"),
         (true, false) => include_bytes!("../../windows/tray-v-white.ico"),
@@ -835,20 +834,26 @@ fn front_app() -> (String, bool) {
 }
 
 fn tray(message: NOTIFY_ICON_MESSAGE) {
-    let (s, _) = read_settings();
+    thread_local! {
+        /// what the tray shows now: refreshed after every app switch, mostly unchanged
+        static SHOWN: RefCell<Option<(bool, bool, i32, String)>> = const { RefCell::new(None) };
+    }
+    // the app state, not the registry: this runs after every foreground change
+    let (language, input_type) = with_app(|a| (a.engine.s.language, a.engine.s.input_type)).unwrap_or_else(|| {
+        let (s, _) = read_settings();
+        (s.language, s.input_type)
+    });
     let (front, excluded) = front_app();
     // "E" while typing goes untouched (English, or an excluded app)
-    let vietnamese = s.language == 1 && !excluded;
+    let vietnamese = language == 1 && !excluded;
     unsafe {
         let size = GetSystemMetricsForDpi(SM_CXSMICON, GetDpiForWindow(main_hwnd()).max(96));
-        let icon = if message == NIM_DELETE { null_mut() } else { tray_icon(vietnamese, size) };
         let mut data = NOTIFYICONDATAW {
             cbSize: size_of::<NOTIFYICONDATAW>() as u32,
             hWnd: main_hwnd(),
             uID: 1,
             uFlags: NIF_MESSAGE | NIF_ICON | NIF_TIP,
             uCallbackMessage: WM_TRAY,
-            hIcon: icon,
             ..std::mem::zeroed()
         };
         let mode = if vietnamese { "Tiếng Việt" } else { "Tiếng Anh" };
@@ -860,8 +865,16 @@ fn tray(message: NOTIFY_ICON_MESSAGE) {
         } else if excluded {
             format!("VKeyEngine · Đang tắt trong {front}")
         } else {
-            format!("VKeyEngine · {mode} · {}", INPUT_TYPES[s.input_type as usize])
+            format!("VKeyEngine · {mode} · {}", INPUT_TYPES[(input_type as usize).min(INPUT_TYPES.len() - 1)])
         };
+        let light = personalize("SystemUsesLightTheme", false); // taskbar theme
+        let state = (vietnamese, light, size, tip.clone());
+        if message == NIM_MODIFY && SHOWN.with(|v| v.borrow().as_ref() == Some(&state)) {
+            return; // nothing changed: no new icon
+        }
+        SHOWN.with(|v| *v.borrow_mut() = (message != NIM_DELETE).then_some(state));
+        let icon = if message == NIM_DELETE { null_mut() } else { tray_icon(vietnamese, light, size) };
+        data.hIcon = icon;
         copy_wide(&mut data.szTip, &tip);
         if Shell_NotifyIconW(message, &data) == 0 && message == NIM_MODIFY {
             Shell_NotifyIconW(NIM_ADD, &data);
@@ -2608,8 +2621,8 @@ const HUD_W: f32 = 34.0;
 const HUD_H: f32 = 26.0;
 
 thread_local! {
-    /// badge window, its text, and fade ticks / alpha
-    static HUD: RefCell<(HWND, &'static str, u32, u8)> = const { RefCell::new((null_mut(), "V", 0, 255)) };
+    /// badge window, its text, fade ticks / alpha, and ticks fully visible
+    static HUD: RefCell<(HWND, &'static str, u32, u8, u32)> = const { RefCell::new((null_mut(), "V", 0, 255, 12)) };
 }
 
 /// Briefly show V or E next to the text caret (or the mouse pointer when the app does not
@@ -2651,7 +2664,8 @@ fn show_mode_hud(note: Option<&'static str>) {
         }
         HUD.with(|hud| {
             let mut hud = hud.borrow_mut();
-            (hud.1, hud.2, hud.3) = (text, 0, 255);
+            // ticks of 50 ms fully visible: a note needs time to be read
+            (hud.1, hud.2, hud.3, hud.4) = (text, 0, 255, if note.is_some() { 100 } else { 12 });
         });
         let radius = (14.0 * s) as i32;
         SetWindowRgn(hwnd, CreateRoundRectRgn(0, 0, w + 1, h + 1, radius, radius), 0);
@@ -2683,11 +2697,11 @@ unsafe extern "system" fn hud_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
             0
         }
         WM_TIMER if wparam == TIMER_HUD => {
-            // 0.6 s fully visible, then fade out
+            // fully visible for a while, then fade out
             let alpha = HUD.with(|h| {
                 let mut h = h.borrow_mut();
                 h.2 += 1;
-                if h.2 > 12 {
+                if h.2 > h.4 {
                     h.3 = h.3.saturating_sub(51);
                 }
                 h.3

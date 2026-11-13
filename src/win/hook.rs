@@ -11,7 +11,8 @@
 //! - Caps Lock only changes letters (Caps Lock + "1" no longer restores to "!").
 
 use super::{hotkey, ui, with_app, App};
-use crate::engine::{encode_output, is_double_code, Code, KeyEvent, KeyState, MAX_BUFF};
+use crate::engine::{Code, KeyEvent, KeyState};
+use crate::output::{BrowserFix, Ctx, Output, Step, Typed};
 use crate::tables::*;
 use std::cell::Cell;
 use std::sync::atomic::{AtomicBool, AtomicIsize, AtomicU32, Ordering};
@@ -43,11 +44,9 @@ const WIN: u32 = 0x20;
 
 #[derive(Default)]
 pub struct Hook {
-    /// UTF-16 length of each character of the current word (double-code tables only)
-    pub sync_key: Vec<u8>,
+    pub out: Output,
     flag: u32,
     last_flag: u32,
-    has_just_used_hotkey: bool,
     /// virtual key of the last non-modifier key
     vk: u16,
 }
@@ -86,10 +85,7 @@ pub fn start() {
             if msg.message == WM_REHOOK {
                 uninstall();
                 install();
-                with_app(|a| {
-                    a.engine.start_new_session();
-                    a.hook.sync_key.clear();
-                });
+                with_app(|a| a.forget_screen()); // keys typed meanwhile never reached us
                 continue;
             }
             TranslateMessage(&msg);
@@ -161,20 +157,13 @@ unsafe extern "system" fn keyboard_proc(code: i32, wparam: WPARAM, lparam: LPARA
     if k.dwExtraInfo == OUR_EVENT {
         return next();
     }
-    // The IME of another language (Japanese, Chinese...) is open. With a timeout: a hung
-    // app must not stall the hook (Windows would remove it).
-    let ime = ImmGetDefaultIMEWnd(GetForegroundWindow());
-    let mut open = 0usize;
-    if !ime.is_null()
-        && SendMessageTimeoutW(ime, WM_IME_CONTROL, IMC_GETOPENSTATUS, 0, SMTO_ABORTIFHUNG, 50, &mut open) != 0
-        && open != 0
-    {
-        return next();
-    }
     if FRONT_ELEVATED.load(Ordering::SeqCst) {
         return next(); // whatever we send would be blocked, so leave the key alone
     }
     let msg = wparam as u32;
+    if other_ime_open(msg == WM_KEYDOWN || msg == WM_SYSKEYDOWN) {
+        return next();
+    }
     let started = std::time::Instant::now();
     let swallow = guarded(|a| handle_key(a, msg, k.vkCode as u16)).unwrap_or(false);
     if msg == WM_KEYDOWN || msg == WM_SYSKEYDOWN {
@@ -187,6 +176,30 @@ unsafe extern "system" fn keyboard_proc(code: i32, wparam: WPARAM, lparam: LPARA
     }
 }
 
+/// The IME of another language (Japanese, Chinese...) is open in the foreground window.
+/// Asking means a call into that app, which waits while it is busy, and a slow hook lets a
+/// fast next key overtake our output (garbled words): ask on key down only, at most every
+/// half second per window, with a short timeout.
+unsafe fn other_ime_open(key_down: bool) -> bool {
+    thread_local! {
+        /// foreground window, GetTickCount() of the answer, IME open
+        static CACHE: Cell<(HWND, u32, bool)> = const { Cell::new((std::ptr::null_mut(), 0, false)) };
+    }
+    let (hwnd, at, open) = CACHE.get();
+    let fg = GetForegroundWindow();
+    let now = GetTickCount();
+    if !key_down || (fg == hwnd && now.wrapping_sub(at) < 500) {
+        return open;
+    }
+    let ime = ImmGetDefaultIMEWnd(fg);
+    let mut answer = 0usize;
+    let open = !ime.is_null()
+        && SendMessageTimeoutW(ime, WM_IME_CONTROL, IMC_GETOPENSTATUS, 0, SMTO_ABORTIFHUNG, 20, &mut answer) != 0
+        && answer != 0;
+    CACHE.set((fg, now, open));
+    open
+}
+
 unsafe extern "system" fn mouse_proc(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
     if code >= 0 {
         let click = matches!(
@@ -194,10 +207,7 @@ unsafe extern "system" fn mouse_proc(code: i32, wparam: WPARAM, lparam: LPARAM) 
             WM_LBUTTONDOWN | WM_RBUTTONDOWN | WM_MBUTTONDOWN | WM_XBUTTONDOWN | WM_LBUTTONUP | WM_RBUTTONUP | WM_MBUTTONUP | WM_XBUTTONUP
         );
         if click {
-            guarded(|a| {
-                a.engine.handle_event(KeyEvent::Mouse, KeyState::MouseDown, 0, 0, false);
-                a.hook.sync_key.clear();
-            });
+            guarded(|a| a.forget_screen());
         }
     }
     CallNextHookEx(std::ptr::null_mut(), code, wparam, lparam)
@@ -212,9 +222,14 @@ unsafe extern "system" fn foreground_changed(
     _thread: u32,
     _time: u32,
 ) {
-    let Some((exe, elevated)) = foreground_app() else { return };
+    let (exe, elevated) = foreground_app();
+    // always stored: a stale "elevated" would leave every key alone in the next app
     FRONT_ELEVATED.store(elevated, Ordering::SeqCst);
+    let Some(exe) = exe else { return };
     if exe.eq_ignore_ascii_case("explorer.exe") {
+        // taskbar, tray menu, desktop: the app the menu talks about stays the previous one,
+        // but the caret did move (renaming a file, the address bar)
+        guarded(|a| a.forget_screen());
         return;
     }
     guarded(|a| a.on_active_app_changed(exe));
@@ -238,18 +253,19 @@ unsafe fn is_elevated(process: HANDLE) -> bool {
     ok != 0 && e.TokenIsElevated != 0
 }
 
-/// Executable name of the foreground window's process, and whether it is out of our reach
-/// (elevated while we are not).
-fn foreground_app() -> Option<(String, bool)> {
+/// Executable name of the foreground window's process (None: no window, ours, or a process
+/// we may not even open), and whether it is out of our reach (elevated while we are not).
+fn foreground_app() -> (Option<String>, bool) {
     unsafe {
         let mut pid = 0u32;
         GetWindowThreadProcessId(GetForegroundWindow(), &mut pid);
         if pid == 0 || pid == GetCurrentProcessId() {
-            return None;
+            return (None, false);
         }
         let process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
         if process.is_null() {
-            return None;
+            // protected / elevated process, unless we run elevated ourselves
+            return (None, !is_elevated(GetCurrentProcess()));
         }
         let mut buf = [0u16; 1024];
         let mut len = buf.len() as u32;
@@ -257,7 +273,7 @@ fn foreground_app() -> Option<(String, bool)> {
         let elevated = is_elevated(process) && !is_elevated(GetCurrentProcess());
         CloseHandle(process);
         let path = String::from_utf16_lossy(&buf[..len as usize]);
-        ok.then(|| (path.rsplit('\\').next().unwrap_or_default().to_string(), elevated))
+        (ok.then(|| path.rsplit('\\').next().unwrap_or_default().to_string()), elevated)
     }
 }
 
@@ -371,21 +387,18 @@ fn handle_key(app: &mut App, msg: u32, vk: u16) -> bool {
             h.last_flag = 0;
         } else {
             if check_hotkey(switch_key, h.last_flag, vk, true) && hotkey::key(switch_key) == vk {
-                h.has_just_used_hotkey = true;
                 h.vk = 0;
                 mask_menu_key(h.last_flag);
                 switch_language(app);
                 return true;
             }
             if check_hotkey(convert_key, h.last_flag, vk, true) && hotkey::key(convert_key) == vk {
-                h.has_just_used_hotkey = true;
                 h.vk = 0;
                 mask_menu_key(h.last_flag);
                 ui::post_quick_convert();
                 return true;
             }
         }
-        h.has_just_used_hotkey = h.last_flag != 0;
     } else if modifier.is_some() {
         let h = &mut app.hook;
         if h.last_flag == 0 || h.last_flag < h.flag {
@@ -394,16 +407,13 @@ fn handle_key(app: &mut App, msg: u32, vk: u16) -> bool {
             // modifiers released: modifier-only hot keys
             let (last, vk) = (h.last_flag, h.vk);
             if check_hotkey(switch_key, last, vk, has_key(switch_key)) {
-                app.hook.has_just_used_hotkey = true;
                 switch_language(app);
             }
             if check_hotkey(convert_key, last, vk, has_key(convert_key)) {
-                app.hook.has_just_used_hotkey = true;
                 ui::post_quick_convert();
             }
             let h = &mut app.hook;
             h.last_flag = h.flag;
-            h.has_just_used_hotkey = false;
         }
         app.hook.vk = 0;
         return false;
@@ -416,7 +426,9 @@ fn handle_key(app: &mut App, msg: u32, vk: u16) -> bool {
     let caps_lock = letter && flag & CAPITAL != 0;
     let caps = shift != caps_lock;
     let caps_status = if shift && caps_lock { 0 } else if shift { 1 } else if caps_lock { 2 } else { 0 };
-    let other_control_key = flag & (CONTROL | ALT) != 0;
+    // Win + key is a shortcut (Win+D must not become "đ"); keys the engine does not know
+    // (numpad, F keys, Home...) end the word instead of joining it
+    let other_control_key = flag & (CONTROL | ALT | WIN) != 0 || ek >= VK_BASE;
 
     // statistics: counts only (a character never leaves this function)
     if down && !other_control_key {
@@ -435,7 +447,7 @@ fn handle_key(app: &mut App, msg: u32, vk: u16) -> bool {
         if app.engine.s.use_macro && app.engine.s.use_macro_in_english && down {
             app.engine.english_mode(KeyState::KeyDown, ek, caps, other_control_key);
             if app.engine.hook.code == Code::ReplaceMacro {
-                handle_macro(app, ek, shift);
+                output(app, Typed::Printable, vk);
                 return true;
             }
         }
@@ -450,58 +462,12 @@ fn handle_key(app: &mut App, msg: u32, vk: u16) -> bool {
     if !undone {
         app.engine.handle_event(KeyEvent::Keyboard, KeyState::KeyDown, ek, caps_status, other_control_key);
     }
-    let table = app.engine.s.code_table;
-    let double = is_double_code(table);
-    match app.engine.hook.code {
-        Code::DoNothing => {
-            if double {
-                let h = &mut app.hook;
-                match app.engine.hook.ext_code {
-                    1 => h.sync_key.clear(),
-                    2 => {
-                        if let Some(last) = h.sync_key.pop() {
-                            if last > 1 {
-                                send_vk(VK_BACK, 0);
-                            }
-                        }
-                    }
-                    3 => h.sync_key.push(1),
-                    _ => {}
-                }
-            }
-            false
-        }
-        Code::WillProcess | Code::Restore | Code::RestoreAndStartNewSession => {
-            let mut bs = app.engine.hook.backspace_count;
-            if app.opt.fix_recommend_browser && app.engine.hook.ext_code != 4 {
-                let chromium = CHROMIUM_APPS.iter().any(|c| c.eq_ignore_ascii_case(&app.front_app));
-                if app.opt.fix_chromium_browser && chromium {
-                    if bs > 0 {
-                        shift_left(app, double);
-                        if bs == 1 {
-                            bs = 0;
-                        }
-                    }
-                } else {
-                    empty_char(app, double);
-                    bs += 1;
-                }
-            }
-            if bs > 0 && bs < MAX_BUFF as i32 {
-                for _ in 0..bs {
-                    backspace(app, double);
-                }
-            }
-            let typed = key_to_char(ek as u32 | if caps { CAPS_MASK } else { 0 });
-            send_new_chars(app, (typed != 0).then_some(typed), vk);
-            true
-        }
-        Code::ReplaceMacro => {
-            handle_macro(app, ek, shift);
-            true
-        }
-        Code::BreakWord => false,
-    }
+    // the typed key is sent again as a key, not as a character: the active keyboard layout
+    // then types what it types (punctuation of non-US layouts)
+    let typed = if key_to_char(ek as u32) != 0 { Typed::Printable } else { Typed::Control };
+    let code = app.engine.hook.code;
+    output(app, if code == Code::ReplaceMacro { Typed::Printable } else { typed }, vk);
+    code != Code::DoNothing
 }
 
 // ---------------------------------------------------------------- output
@@ -525,132 +491,57 @@ fn send_vk(vk: u16, flags: KEYBD_EVENT_FLAGS) {
     send(&[key_input(vk, 0, flags), key_input(vk, 0, flags | KEYEVENTF_KEYUP)]);
 }
 
-/// Unicode key events (down + up) for each UTF-16 unit.
-fn units_input(units: &[u16], out: &mut Vec<INPUT>) {
-    for &u in units {
-        out.push(key_input(0, u, KEYEVENTF_UNICODE));
-        out.push(key_input(0, u, KEYEVENTF_UNICODE | KEYEVENTF_KEYUP));
-    }
+/// Key press (down + up) of `vk`.
+fn tap(inputs: &mut Vec<INPUT>, vk: u16, flags: KEYBD_EVENT_FLAGS) {
+    inputs.push(key_input(vk, 0, flags));
+    inputs.push(key_input(vk, 0, flags | KEYEVENTF_KEYUP));
 }
 
-fn send_chars(app: &App, chars: &[Vec<u16>]) {
-    let mut inputs = Vec::new();
-    for c in chars {
-        units_input(c, &mut inputs);
-        if app.opt.send_key_step_by_step {
-            send(&inputs);
-            inputs.clear();
+fn is_extended(vk: u16) -> bool {
+    matches!(vk, VK_LEFT | VK_RIGHT | VK_UP | VK_DOWN | VK_HOME | VK_END | VK_PRIOR | VK_NEXT | VK_INSERT | VK_DELETE)
+}
+
+/// Send what the engine's last result needs on screen, in one SendInput call: input that
+/// is sent in one call is never interleaved with other input, so a key typed fast cannot
+/// land between our backspaces and the new characters.
+fn output(app: &mut App, typed: Typed, vk: u16) {
+    let code = app.engine.hook.code;
+    if code == Code::ReplaceMacro {
+        if let Some(name) = app.engine.last_macro.take() {
+            crate::stats::record_macro(&name);
         }
     }
-    send(&inputs);
-}
-
-fn backspace(app: &mut App, double: bool) {
-    send_vk(VK_BACK, 0);
-    if double {
-        if app.hook.sync_key.last().is_some_and(|&l| l > 1) {
-            send_vk(VK_BACK, 0);
-        }
-        app.hook.sync_key.pop();
-    }
-}
-
-/// Select the previous character (Chromium address bar autocomplete fix).
-fn shift_left(app: &mut App, double: bool) {
-    let times = if double && app.hook.sync_key.last().is_some_and(|&l| l > 1) { 2 } else { 1 };
-    if double {
-        app.hook.sync_key.pop();
-    }
-    let mut inputs = vec![key_input(VK_LSHIFT, 0, 0)];
-    for _ in 0..times {
-        inputs.push(key_input(VK_LEFT, 0, KEYEVENTF_EXTENDEDKEY));
-        inputs.push(key_input(VK_LEFT, 0, KEYEVENTF_EXTENDEDKEY | KEYEVENTF_KEYUP));
-    }
-    inputs.push(key_input(VK_LSHIFT, 0, KEYEVENTF_KEYUP));
-    send(&inputs);
-}
-
-/// An invisible character that closes the browser's autocomplete suggestion.
-fn empty_char(app: &mut App, double: bool) {
-    if double {
-        app.hook.sync_key.push(1);
-    }
-    let mut inputs = Vec::new();
-    units_input(&[0x202F], &mut inputs);
-    send(&inputs);
-}
-
-/// Send the engine's new characters (and the typed key when restoring).
-fn send_new_chars(app: &mut App, typed: Option<u16>, vk: u16) {
-    let table = app.engine.s.code_table;
-    let double = is_double_code(table);
-    let h = &app.engine.hook;
-    let code = h.code;
-    let mut chars: Vec<Vec<u16>> = Vec::new();
-    let mut lens: Vec<u8> = Vec::new();
-    for i in (0..h.new_char_count.clamp(0, MAX_BUFF as i32) as usize).rev() {
-        let mut u = Vec::new();
-        lens.push(encode_output(h.char_data[i], table, &mut u));
-        chars.push(u);
-    }
-    let restore = matches!(code, Code::Restore | Code::RestoreAndStartNewSession);
-    let mut send_control_key = false;
-    if restore {
-        match typed {
-            Some(c) => {
-                chars.push(vec![c]);
-                lens.push(1);
-            }
-            None => send_control_key = true,
-        }
-    }
-    if code == Code::RestoreAndStartNewSession {
-        app.engine.start_new_session();
-    }
-    if double {
-        app.hook.sync_key.extend_from_slice(&lens);
-    }
-    send_chars(app, &chars);
-    // invalid word ended with a control key (tab, arrows...): send that key too
-    if send_control_key {
-        send_vk(vk, 0);
-    }
-}
-
-fn handle_macro(app: &mut App, ek: u16, shift: bool) {
-    if let Some(name) = app.engine.last_macro.take() {
-        crate::stats::record_macro(&name);
-    }
-    let table = app.engine.s.code_table;
-    let double = is_double_code(table);
-    let mut bs = app.engine.hook.backspace_count;
+    let mut ctx = Ctx::default();
     if app.opt.fix_recommend_browser {
-        empty_char(app, double);
-        bs += 1;
+        let chromium = CHROMIUM_APPS.iter().any(|c| c.eq_ignore_ascii_case(&app.front_app));
+        ctx.browser_fix = if app.opt.fix_chromium_browser && chromium && code != Code::ReplaceMacro {
+            BrowserFix::SelectLeft
+        } else {
+            BrowserFix::EmptyChar
+        };
     }
-    for _ in 0..bs.max(0) {
-        backspace(app, double);
-    }
-    let mut chars: Vec<Vec<u16>> = Vec::new();
-    for &c in &app.engine.hook.macro_data {
-        let mut u = Vec::new();
-        let l = encode_output(c, table, &mut u);
-        if double {
-            app.hook.sync_key.push(l);
+    let steps = app.hook.out.plan(&mut app.engine, &ctx, typed);
+    let mut inputs: Vec<INPUT> = Vec::new();
+    for s in steps {
+        match s {
+            Step::Delete => tap(&mut inputs, VK_BACK, 0),
+            Step::SelectLeft => {
+                inputs.push(key_input(VK_LSHIFT, 0, 0));
+                inputs.push(key_input(VK_LEFT, 0, KEYEVENTF_EXTENDEDKEY));
+                inputs.push(key_input(VK_LEFT, 0, KEYEVENTF_EXTENDEDKEY | KEYEVENTF_KEYUP));
+                inputs.push(key_input(VK_LSHIFT, 0, KEYEVENTF_KEYUP));
+            }
+            Step::Text(units) => {
+                for u in units {
+                    inputs.push(key_input(0, u, KEYEVENTF_UNICODE));
+                    inputs.push(key_input(0, u, KEYEVENTF_UNICODE | KEYEVENTF_KEYUP));
+                }
+            }
+            // the modifiers the user holds still apply (Shift, Caps Lock)
+            Step::Key => tap(&mut inputs, vk, if is_extended(vk) { KEYEVENTF_EXTENDEDKEY } else { 0 }),
         }
-        chars.push(u);
     }
-    // re-send the key that triggered the macro (space, punctuation)
-    match key_to_char(ek as u32 | if shift { CAPS_MASK } else { 0 }) {
-        0 => {
-            send_chars(app, &chars);
-            send_vk(app.hook.vk, 0);
-        }
-        c => {
-            chars.push(vec![c]);
-            send_chars(app, &chars);
-        }
-    }
+    send(&inputs);
 }
 
 #[cfg(test)]

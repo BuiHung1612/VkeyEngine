@@ -214,23 +214,39 @@ pub fn seconds_since_key() -> f64 {
     CGEventSource::seconds_since_last_event_type(CGEventSourceStateID::HIDSystemState, CGEventType::KeyDown)
 }
 
+thread_local! {
+    /// Spotlight panel on screen, and when that was checked
+    static SPOTLIGHT: std::cell::Cell<Option<(std::time::Instant, bool)>> = const { std::cell::Cell::new(None) };
+}
+
 /// Spotlight search panel is on screen (it is not the frontmost app, so check windows).
-/// The window list scan costs a few ms, so a result is reused for half a second: typing a
-/// word asks once instead of on every rewritten key.
+/// The window list scan costs a few ms, so it runs in the key callback only when there is no
+/// recent answer: Cmd (Cmd + Space opens Spotlight) drops the answer, otherwise the last one
+/// is used and checked again after the key is handled.
 pub fn is_spotlight_visible() -> bool {
-    use std::cell::Cell;
     use std::time::{Duration, Instant};
-    thread_local! {
-        static CACHE: Cell<Option<(Instant, bool)>> = const { Cell::new(None) };
-    }
-    if let Some((at, v)) = CACHE.get() {
-        if at.elapsed() < Duration::from_millis(500) {
-            return v;
+    match SPOTLIGHT.get() {
+        Some((at, v)) if at.elapsed() < Duration::from_secs(5) => {
+            if at.elapsed() > Duration::from_millis(300) {
+                super::ui::defer(refresh_spotlight);
+            }
+            v
+        }
+        _ => {
+            let v = scan_for_spotlight();
+            SPOTLIGHT.set(Some((Instant::now(), v)));
+            v
         }
     }
-    let v = scan_for_spotlight();
-    CACHE.set(Some((Instant::now(), v)));
-    v
+}
+
+/// Check the next time from scratch (Spotlight may be opening or closing).
+pub fn forget_spotlight() {
+    SPOTLIGHT.set(None);
+}
+
+fn refresh_spotlight() {
+    SPOTLIGHT.set(Some((std::time::Instant::now(), scan_for_spotlight())));
 }
 
 fn scan_for_spotlight() -> bool {
@@ -239,10 +255,11 @@ fn scan_for_spotlight() -> bool {
     let Some(list) = CGWindowListCopyWindowInfo(opts, 0) else { return false };
     let list: &NSArray<NSDictionary<NSString, AnyObject>> = unsafe { &*(objc2_core_foundation::CFRetained::as_ptr(&list).as_ptr() as *const _) };
     let owner = NSString::from_str("kCGWindowOwnerName");
+    let spotlight = NSString::from_str("Spotlight");
     list.iter().any(|w| {
         w.objectForKey(&owner)
             .and_then(|o| o.downcast::<NSString>().ok())
-            .is_some_and(|s| s.to_string() == "Spotlight")
+            .is_some_and(|s| s.isEqualToString(&spotlight))
     })
 }
 
@@ -286,7 +303,21 @@ pub fn process_usage() -> (std::time::Duration, u64) {
 }
 
 /// Display name of an installed app from its bundle id (the id itself if not found).
+/// Name of an installed app; remembered, as the lookup asks LaunchServices (the menu shows
+/// the excluded apps' names after every app switch).
 pub fn app_name(bundle_id: &str) -> String {
+    thread_local! {
+        static NAMES: std::cell::RefCell<std::collections::HashMap<String, String>> = Default::default();
+    }
+    if let Some(n) = NAMES.with(|m| m.borrow().get(bundle_id).cloned()) {
+        return n;
+    }
+    let n = look_up_app_name(bundle_id);
+    NAMES.with(|m| m.borrow_mut().insert(bundle_id.to_string(), n.clone()));
+    n
+}
+
+fn look_up_app_name(bundle_id: &str) -> String {
     use objc2_app_kit::NSWorkspace;
     NSWorkspace::sharedWorkspace()
         .URLForApplicationWithBundleIdentifier(&NSString::from_str(bundle_id))

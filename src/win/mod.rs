@@ -80,6 +80,8 @@ pub struct App {
     pub front_app: String,
     /// executables where VKeyEngine stays out of the way (lowercase)
     pub excluded: Vec<String>,
+    /// the front app is excluded (worked out when the app or the list changes, not per key)
+    front_is_excluded: bool,
 }
 
 pub static APP: Mutex<Option<App>> = Mutex::new(None);
@@ -154,7 +156,7 @@ impl App {
         let mut smart = SmartSwitch::default();
         smart.load_binary(&reg::data("smartSwitchKey"));
         let excluded = String::from_utf8_lossy(&reg::data("ExcludedApps")).lines().filter(|l| !l.is_empty()).map(str::to_string).collect();
-        App { engine, opt, smart, hook: hook::Hook::default(), front_app: String::new(), excluded }
+        App { engine, opt, smart, hook: hook::Hook::default(), front_app: String::new(), excluded, front_is_excluded: false }
     }
 
     /// Re-read settings after the UI changed them.
@@ -174,14 +176,21 @@ impl App {
         self.opt = opt;
     }
 
+    /// The caret may have moved without us seeing it (focus change, click, missed keys):
+    /// nothing on screen may be edited any more.
+    pub fn forget_screen(&mut self) {
+        self.engine.reset();
+        self.hook.out.clear();
+    }
+
     /// Keys go through untouched in the foreground app (it is in the exclusion list).
     pub fn front_excluded(&self) -> bool {
-        crate::exclude::is_excluded(&self.excluded, &self.front_app.to_lowercase())
+        self.front_is_excluded
     }
 
     /// Vietnamese is on but the front app is a remote desktop client we stay out of.
     pub fn in_remote(&self) -> bool {
-        self.engine.s.language == 1 && crate::exclude::is_remote(&self.front_app.to_lowercase()) && self.front_excluded()
+        self.engine.s.language == 1 && crate::exclude::is_remote(&self.front_app) && self.front_excluded()
     }
 
     /// Add or remove the foreground app from the exclusion list.
@@ -191,11 +200,11 @@ impl App {
         }
         crate::exclude::toggle(&mut self.excluded, &self.front_app.to_lowercase());
         self.save_excluded();
-        self.engine.start_new_session();
-        self.hook.sync_key.clear();
+        self.forget_screen();
     }
 
-    pub fn save_excluded(&self) {
+    pub fn save_excluded(&mut self) {
+        self.front_is_excluded = crate::exclude::is_excluded(&self.excluded, &self.front_app.to_lowercase());
         reg::set_data("ExcludedApps", self.excluded.join("\n").as_bytes());
     }
 
@@ -219,14 +228,14 @@ impl App {
     fn on_code_table_changed(&mut self) {
         let t = self.engine.s.code_table;
         self.engine.set_code_table(t);
-        self.hook.sync_key.clear();
+        self.hook.out.clear();
         if self.opt.remember_code {
             self.save_smart();
         }
     }
 
     fn on_language_changed(&mut self) {
-        self.engine.start_new_session();
+        self.forget_screen(); // also the per-character lengths: English types none
         if self.opt.use_smart_switch_key {
             self.save_smart();
         }
@@ -250,9 +259,8 @@ impl App {
     /// Smart switch: restore the language / code table remembered for the new foreground app.
     pub fn on_active_app_changed(&mut self, exe: String) {
         self.front_app = exe;
-        self.engine.start_new_session();
-        self.engine.temp_off_engine(false);
-        self.hook.sync_key.clear();
+        self.front_is_excluded = crate::exclude::is_excluded(&self.excluded, &self.front_app.to_lowercase());
+        self.forget_screen();
         // excluded app: keys go through anyway, and a language remembered for it (e.g. English
         // for a remote desktop client, from before it was excluded) would only hide that
         if self.front_excluded() {

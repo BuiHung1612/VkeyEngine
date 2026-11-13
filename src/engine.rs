@@ -17,13 +17,14 @@ use crate::tables::*;
 
 pub const MAX_BUFF: usize = 32;
 const MAXB: i32 = MAX_BUFF as i32;
+/// words (and runs of spaces / punctuation) remembered for backspacing into
+const MAX_STATES: usize = 64;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub enum Code {
     #[default]
     DoNothing = 0,
     WillProcess,
-    BreakWord,
     Restore,
     ReplaceMacro,
     RestoreAndStartNewSession,
@@ -38,9 +39,7 @@ pub enum KeyEvent {
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum KeyState {
     KeyDown,
-    KeyUp,
     MouseDown,
-    MouseUp,
 }
 
 pub const TELEX: u8 = 0;
@@ -254,7 +253,6 @@ pub struct Engine {
     vwsm: i32,
     is_restored_w: bool,
     is_checked_grammar: bool,
-    is_caps: bool,
     space_count: i32,
     has_handled_macro: bool,
     upper_case_status: u8,
@@ -262,7 +260,6 @@ pub struct Engine {
     /// Runtime spell checking flag (may be temporarily toggled with a hot key).
     spelling_on: bool,
     has_handle_quick_consonant: bool,
-    will_temp_off_engine: bool,
     spelling_ok: bool,
     spelling_vowel_ok: bool,
 }
@@ -297,14 +294,12 @@ impl Engine {
             vwsm: 0,
             is_restored_w: false,
             is_checked_grammar: false,
-            is_caps: false,
             space_count: 0,
             has_handled_macro: false,
             upper_case_status: 0,
             special_char: Vec::new(),
             spelling_on,
             has_handle_quick_consonant: false,
-            will_temp_off_engine: false,
             spelling_ok: false,
             spelling_vowel_ok: false,
         }
@@ -430,13 +425,23 @@ impl Engine {
         self.long_word_helper.clear();
     }
 
+    /// Forget everything about what is on screen: the word, the words before it (backspace
+    /// history), pending spaces / punctuation and the macro keys. For a focus change, a mouse
+    /// click or keys that may have been missed (tap / hook re-installed): the caret is
+    /// somewhere else now, so nothing typed before may be edited.
+    pub fn reset(&mut self) {
+        self.start_new_session();
+        self.typing_states.clear();
+        self.space_count = 0;
+        self.special_char.clear();
+        self.hook.macro_key.clear();
+        self.upper_case_status = 0;
+        self.spelling_on = self.s.check_spelling;
+    }
+
     pub fn set_check_spelling(&mut self, on: bool) {
         self.s.check_spelling = on;
         self.spelling_on = on;
-    }
-
-    pub fn temp_off_engine(&mut self, off: bool) {
-        self.will_temp_off_engine = off;
     }
 
     pub fn set_code_table(&mut self, table: u8) {
@@ -664,12 +669,20 @@ impl Engine {
         }
     }
 
+    /// Words kept for backspacing into: enough to go back over a few lines.
+    fn push_state(&mut self, v: Vec<u32>) {
+        if self.typing_states.len() >= MAX_STATES {
+            self.typing_states.remove(0);
+        }
+        self.typing_states.push(v);
+    }
+
     fn push_chunked(&mut self, data: &[u32]) {
         for chunk in data.chunks(MAX_BUFF) {
-            self.typing_states.push(chunk.to_vec());
+            self.push_state(chunk.to_vec());
         }
         if data.is_empty() {
-            self.typing_states.push(Vec::new());
+            self.push_state(Vec::new());
         }
     }
 
@@ -681,7 +694,7 @@ impl Engine {
                     self.push_chunked(&long);
                 }
                 let word = self.typing_word[..self.index as usize].to_vec();
-                self.typing_states.push(word);
+                self.push_state(word);
             }
         } else {
             let data = self.hook.macro_data.clone();
@@ -690,12 +703,12 @@ impl Engine {
     }
 
     fn save_word_repeat(&mut self, key_code: u32, count: i32) {
-        self.typing_states.push(vec![key_code; count.max(0) as usize]);
+        self.push_state(vec![key_code; count.max(0) as usize]);
     }
 
     fn save_special_char(&mut self) {
         let sc = std::mem::take(&mut self.special_char);
-        self.typing_states.push(sc);
+        self.push_state(sc);
     }
 
     fn restore_last_typing_state(&mut self) {
@@ -1430,12 +1443,6 @@ impl Engine {
         word.len() >= 3 && english_words().binary_search(&word.as_str()).is_ok()
     }
 
-    /// The current word failed the spelling check (used to build the English word list).
-    #[doc(hidden)]
-    pub fn spelling_failed(&self) -> bool {
-        self.temp_disable_key
-    }
-
     /// Esc right after a word was changed: put back the keys exactly as typed, and keep the
     /// rest of the word as typed. False (nothing to undo) if the word shows as typed.
     pub fn undo_word(&mut self) -> bool {
@@ -1535,24 +1542,20 @@ impl Engine {
     /// Key handling while in English mode (only macros are processed).
     pub fn english_mode(&mut self, state: KeyState, data: u16, is_caps: bool, other_control_key: bool) {
         self.hook.code = Code::DoNothing;
+        self.hook.ext_code = 0; // nothing typed in English is tracked per character
         if state == KeyState::MouseDown || (other_control_key && !is_caps) {
             self.hook.macro_key.clear();
-            self.will_temp_off_engine = false;
         } else if data == KEY_SPACE {
             if !self.has_handled_macro && self.find_macro() {
                 self.hook.code = Code::ReplaceMacro;
                 self.hook.backspace_count = self.hook.macro_key.len() as i32;
             }
             self.hook.macro_key.clear();
-            self.will_temp_off_engine = false;
         } else if data == KEY_DELETE {
-            if self.hook.macro_key.pop().is_none() {
-                self.will_temp_off_engine = false;
-            }
+            self.hook.macro_key.pop();
         } else if is_word_break(KeyEvent::Keyboard, data) && !CHAR_KEY_CODE.contains(&data) {
             self.hook.macro_key.clear();
-            self.will_temp_off_engine = false;
-        } else if !self.will_temp_off_engine {
+        } else {
             self.hook.macro_key.push(data as u32 | if is_caps { CAPS_MASK } else { 0 });
         }
     }
@@ -1560,8 +1563,7 @@ impl Engine {
     /// Main entry point for each key.
     /// `caps_status`: 0 none, 1 shift, 2 caps lock (letter will be upper case).
     pub fn handle_event(&mut self, event: KeyEvent, state: KeyState, data: u16, caps_status: u8, other_control_key: bool) {
-        self.is_caps = caps_status == 1 || caps_status == 2;
-        let is_caps = self.is_caps;
+        let is_caps = caps_status == 1 || caps_status == 2;
         let caps_bit = if is_caps { CAPS_MASK } else { 0 };
 
         if (is_number_key(data) && caps_status == 1)
@@ -1584,7 +1586,10 @@ impl Engine {
                 && macro_break
             {
                 self.check_quick_consonant();
-            } else if (self.s.restore_if_wrong_spelling || self.s.restore_english) && is_word_break(event, data) {
+            } else if (self.s.restore_if_wrong_spelling || self.s.restore_english)
+                && event == KeyEvent::Keyboard
+                && is_word_break(event, data)
+            {
                 if !self.temp_disable_key && self.spelling_on {
                     self.check_spelling(true);
                 }
@@ -1611,8 +1616,7 @@ impl Engine {
             if self.hook.code == Code::DoNothing {
                 self.start_new_session();
                 self.spelling_on = self.s.check_spelling;
-                self.will_temp_off_engine = false;
-            } else if self.hook.code == Code::ReplaceMacro || self.has_handle_quick_consonant {
+                } else if self.hook.code == Code::ReplaceMacro || self.has_handle_quick_consonant {
                 self.index = 0;
             }
 
@@ -1632,6 +1636,9 @@ impl Engine {
                 };
             }
         } else if data == KEY_SPACE {
+            // a space goes on screen as one character (a stale 2 "delete" would make the
+            // platform layer delete half of the previous character in 2-unit code tables)
+            self.hook.ext_code = 3;
             if !self.temp_disable_key && self.spelling_on {
                 self.check_spelling(true);
             }
@@ -1671,7 +1678,6 @@ impl Engine {
                 }
             }
             self.spelling_on = self.s.check_spelling;
-            self.will_temp_off_engine = false;
         } else if data == KEY_DELETE {
             self.hook.code = Code::DoNothing;
             self.hook.ext_code = 2;
@@ -1716,11 +1722,6 @@ impl Engine {
                 }
             }
         } else {
-            if self.will_temp_off_engine {
-                self.hook.code = Code::DoNothing;
-                self.hook.ext_code = 3;
-                return;
-            }
             if self.space_count > 0 {
                 self.hook.backspace_count = 0;
                 self.hook.new_char_count = 0;

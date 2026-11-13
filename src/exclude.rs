@@ -4,31 +4,52 @@
 //! garbage, then its own input method adds marks again). "!app" in the list turns that
 //! default off for one client (e.g. RDP to a machine without a Vietnamese input method).
 
-/// Remote desktop clients: macOS bundle ids and Windows exe names, lower case.
-const REMOTE_APPS: &[&str] = &[
-    "com.teamviewer.teamviewer",
+/// Remote desktop clients on macOS: bundle ids (checked against Homebrew casks).
+const MAC_REMOTE: &[&str] = &[
+    "com.teamviewer.TeamViewer",
     "com.philandro.anydesk",
-    "com.microsoft.rdc.macos",
-    "com.microsoft.rdc.mac",
-    "com.apple.screensharing",
+    "com.microsoft.rdc.macos", // Windows App, formerly Microsoft Remote Desktop
+    "com.microsoft.rdc.mac",   // Microsoft Remote Desktop 8 (Mac App Store)
+    "com.apple.ScreenSharing",
     "com.realvnc.vncviewer",
+    "com.realvnc.rvncconnect", // RealVNC Connect
     "com.carriez.rustdesk",
     "tv.parsec.www",
-    "mstsc.exe",
-    "msrdc.exe",
-    "teamviewer.exe",
-    "anydesk.exe",
-    "ultraviewer_desktop.exe",
-    "rustdesk.exe",
-    "vncviewer.exe",
-    "parsecd.exe",
+    "com.splashtop.stb.macosx",
+    "com.nomachine.nxplayer",
+    "com.lemonmojo.RoyalTSX.App",
+    "com.devolutions.remotedesktopmanager",
+];
+
+/// Remote desktop clients on Windows: start of the exe name, so renamed downloads
+/// ("AnyDesk (1).exe", "rustdesk-1.3.0-x86_64.exe", "RoyalTS7.exe") are found too.
+const WIN_REMOTE: &[&str] = &[
+    "mstsc",
+    "msrdc",
+    "teamviewer",
+    "anydesk",
+    "ultraviewer",
+    "rustdesk",
+    "vncviewer",
+    "tvnviewer", // TightVNC
+    "parsecd",
+    "strwinclt", // Splashtop
+    "nxplayer",  // NoMachine
+    "royalts",
+    "remotedesktopmanager",
+    "mremoteng",
+    "rdcman",
 ];
 
 /// Shown when a remote desktop client comes to the front with Vietnamese on.
 pub const REMOTE_NOTE: &str = "Đang remote: máy này không gõ dấu";
 
 pub fn is_remote(app: &str) -> bool {
-    REMOTE_APPS.iter().any(|r| r.eq_ignore_ascii_case(app))
+    let lower = app.to_ascii_lowercase();
+    match lower.strip_suffix(".exe") {
+        Some(_) => WIN_REMOTE.iter().any(|r| lower.starts_with(r)),
+        None => MAC_REMOTE.iter().any(|r| r.eq_ignore_ascii_case(app)),
+    }
 }
 
 fn not(app: &str) -> String {
@@ -74,5 +95,7 @@ mod tests {
         toggle(&mut l, "notepad.exe");
         assert!(!is_excluded(&l, "notepad.exe") && l.is_empty());
         assert!(is_excluded(&l, "com.TeamViewer.TeamViewer"));
+        assert!(is_remote("AnyDesk (1).exe") && is_remote("rustdesk-1.3.0-x86_64.exe"));
+        assert!(!is_remote("anydesk") && !is_remote("chrome.exe") && !is_remote("com.philandro.anydesk.helper"));
     }
 }

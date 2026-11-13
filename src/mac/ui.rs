@@ -298,8 +298,7 @@ define_class!(
         #[unsafe(method(spaceChanged:))]
         fn space_changed(&self, _n: &NSNotification) {
             with_app(|a| {
-                a.engine.start_new_session();
-                a.tap.clear_sync();
+                a.forget_screen();
             });
         }
 
@@ -584,8 +583,7 @@ fn watchdog() {
         if !trusted {
             a.tap.stop();
         } else if a.tap.keep_alive() {
-            a.engine.start_new_session(); // keys typed meanwhile never reached the engine
-            a.tap.clear_sync();
+            a.forget_screen(); // keys typed meanwhile never reached the engine
         }
     });
     thread_local! {
@@ -2279,12 +2277,14 @@ pub fn show_hud(note: Option<&str>) {
     if let Some(t) = ui(|u| u.hud_timer.take()) {
         t.invalidate();
     }
+    // ticks of 0.05 s fully visible: a note needs time to be read
+    let hold = if note.is_some() { 100 } else { 12 };
     let ticks = std::cell::Cell::new(0u32);
     let block = RcBlock::new(move |timer: NonNull<NSTimer>| {
         let n = ticks.get() + 1;
         ticks.set(n);
-        if n <= 12 {
-            return; // 0.6 s fully visible
+        if n <= hold {
+            return;
         }
         let (panel, _) = hud();
         let alpha = panel.alphaValue() - 0.2;

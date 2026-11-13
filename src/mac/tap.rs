@@ -13,7 +13,8 @@
 //! - empty sync-key stack no longer crashes (VNI / Unicode Compound backspace).
 
 use super::{hotkey, sys, ui, with_app, App};
-use crate::engine::{encode_output, is_double_code, Code, KeyEvent, KeyState};
+use crate::engine::{Code, KeyEvent, KeyState};
+use crate::output::{BrowserFix, Ctx, Output, Step, Typed};
 use crate::tables::*;
 use objc2_core_foundation::{kCFRunLoopCommonModes, CFMachPort, CFRetained, CFRunLoop, CFRunLoopSource};
 use objc2_core_graphics::{
@@ -43,8 +44,6 @@ const CHROMIUM_APPS: &[&str] = &[
     "com.microsoft.Edge",
 ];
 const SPOTLIGHT: &str = "com.apple.Spotlight";
-/// Some apps truncate long unicode strings in one event.
-const MAX_UNITS_PER_EVENT: usize = 16;
 
 thread_local! {
     /// The running tap, reachable without borrowing the app state (see `callback`).
@@ -69,10 +68,8 @@ pub struct Tap {
     source: Option<CFRetained<CGEventSource>>,
     source_id: i64,
     proxy: CGEventTapProxy,
-    /// UTF-16 length of each character of the current word (double-code tables only)
-    sync_key: Vec<u8>,
+    out: Output,
     last_flag: u64,
-    has_just_used_hotkey: bool,
     keycode: u16,
     flag: u64,
 }
@@ -97,9 +94,8 @@ impl Tap {
             source,
             source_id,
             proxy: std::ptr::null_mut(),
-            sync_key: Vec::new(),
+            out: Output::default(),
             last_flag: 0,
-            has_just_used_hotkey: false,
             keycode: 0,
             flag: 0,
         }
@@ -175,7 +171,7 @@ impl Tap {
     }
 
     pub fn clear_sync(&mut self) {
-        self.sync_key.clear();
+        self.out.clear();
     }
 
     // ---------- output ----------
@@ -215,58 +211,17 @@ impl Tap {
         }
     }
 
-    /// Post a string, split in chunks without breaking a character.
-    fn post_string(&self, chars: &[Vec<u16>]) {
-        let mut buf: Vec<u16> = Vec::new();
-        for c in chars {
-            if buf.len() + c.len() > MAX_UNITS_PER_EVENT {
-                self.post_units(&buf);
-                buf.clear();
+    fn run(&self, steps: &[Step]) {
+        for s in steps {
+            match s {
+                Step::Delete => self.post_key(KEY_DELETE, None),
+                Step::SelectLeft => self.post_key(KEY_LEFT, Some(CGEventFlags::MaskShift.0)),
+                Step::Text(u) => self.post_units(u),
+                // with the modifiers the user holds: Shift+Enter must stay Shift+Enter
+                Step::Key => self.post_key(self.keycode, Some(self.flag | CGEventFlags::MaskNonCoalesced.0)),
             }
-            buf.extend_from_slice(c);
-        }
-        if !buf.is_empty() {
-            self.post_units(&buf);
         }
     }
-
-    fn uses_compound_workaround(app: &App) -> bool {
-        UNICODE_COMPOUND_APPS.iter().any(|p| app.front_app.starts_with(p))
-    }
-
-    fn backspace(&mut self, double: bool, compound_app: bool, table: u8) {
-        self.post_key(KEY_DELETE, None);
-        if double {
-            if self.sync_key.last().is_some_and(|&l| l > 1) && !(table == 3 && compound_app) {
-                self.post_key(KEY_DELETE, None);
-            }
-            self.sync_key.pop();
-        }
-    }
-
-    fn shift_left(&mut self, double: bool, compound_app: bool, table: u8) {
-        let flags = Some(CGEventFlags::MaskShift.0);
-        self.post_key(KEY_LEFT, flags);
-        if double {
-            if self.sync_key.last().is_some_and(|&l| l > 1) && !(table == 3 && compound_app) {
-                self.post_key(KEY_LEFT, flags);
-            }
-            self.sync_key.pop();
-        }
-    }
-
-    fn empty_char(&mut self, double: bool, front_app: &str) {
-        if double {
-            self.sync_key.push(1);
-        }
-        let c = if NICE_SPACE_APPS.contains(&front_app) { 0x200C } else { 0x202F };
-        self.post_units(&[c]);
-    }
-
-    fn spotlight(&mut self) -> bool {
-        sys::is_spotlight_visible()
-    }
-
 }
 
 /// Character produced by the event (layout aware), if any.
@@ -330,10 +285,7 @@ unsafe extern "C-unwind" fn callback(
             }
         });
         // keys typed while the tap was off never reached the engine
-        with_app(|a| {
-            a.engine.start_new_session();
-            a.tap.clear_sync();
-        });
+        with_app(|a| a.forget_screen());
         return event.as_ptr();
     }
     let ev = unsafe { event.as_ref() };
@@ -356,6 +308,19 @@ fn handle(app: &mut App, proxy: CGEventTapProxy, ty: CGEventType, ev: &CGEvent) 
     if CGEvent::integer_value_field(Some(ev), CGEventField::EventSourceStateID) == app.tap.source_id {
         return Outcome::Pass;
     }
+    let is_mouse = [
+        CGEventType::LeftMouseDown,
+        CGEventType::RightMouseDown,
+        CGEventType::LeftMouseDragged,
+        CGEventType::RightMouseDragged,
+    ]
+    .contains(&ty);
+    if is_mouse {
+        // the caret may be anywhere now: in every mode (also English with macros), and
+        // without a restore of the word being typed
+        app.forget_screen();
+        return Outcome::Pass;
+    }
     let t = &mut app.tap;
     t.flag = CGEvent::flags(Some(ev)).0;
     t.keycode = CGEvent::integer_value_field(Some(ev), CGEventField::KeyboardEventKeycode) as u16;
@@ -364,6 +329,10 @@ fn handle(app: &mut App, proxy: CGEventTapProxy, ty: CGEventType, ev: &CGEvent) 
         if let Some(k) = ch.and_then(keycode_for_char) {
             t.keycode = k;
         }
+    }
+    // Cmd + Space may be opening Spotlight, Esc / Return closing it
+    if ty == CGEventType::KeyDown && (has(t.flag, CGEventFlags::MaskCommand) || matches!(t.keycode, KEY_ESC | KEY_RETURN)) {
+        sys::forget_spotlight();
     }
 
     // hot keys: switch language, quick convert
@@ -375,18 +344,15 @@ fn handle(app: &mut App, proxy: CGEventTapProxy, ty: CGEventType, ev: &CGEvent) 
         } else {
             if hotkey::key(switch_key) == kc && check_hotkey(switch_key, t.last_flag, kc, true) {
                 t.last_flag = 0;
-                t.has_just_used_hotkey = true;
                 switch_language(app);
                 return Outcome::Swallow;
             }
             if hotkey::key(convert_key) == kc && check_hotkey(convert_key, t.last_flag, kc, true) {
                 t.last_flag = 0;
-                t.has_just_used_hotkey = true;
                 ui::defer(ui::convert_selection);
                 return Outcome::Swallow;
             }
         }
-        t.has_just_used_hotkey = t.last_flag != 0;
     } else if ty == CGEventType::FlagsChanged {
         if t.last_flag == 0 || t.last_flag < t.flag {
             t.last_flag = t.flag;
@@ -394,19 +360,15 @@ fn handle(app: &mut App, proxy: CGEventTapProxy, ty: CGEventType, ev: &CGEvent) 
             let has_key = |h: i64| hotkey::key(h) != hotkey::NO_KEY as u16;
             if check_hotkey(switch_key, t.last_flag, t.keycode, has_key(switch_key)) {
                 t.last_flag = 0;
-                t.has_just_used_hotkey = true;
                 switch_language(app);
                 return Outcome::Swallow;
             }
             if check_hotkey(convert_key, t.last_flag, t.keycode, has_key(convert_key)) {
                 t.last_flag = 0;
-                t.has_just_used_hotkey = true;
                 ui::defer(ui::convert_selection);
                 return Outcome::Swallow;
             }
-            let t = &mut app.tap;
-            t.last_flag = 0;
-            t.has_just_used_hotkey = false;
+            app.tap.last_flag = 0;
         }
     }
 
@@ -417,22 +379,12 @@ fn handle(app: &mut App, proxy: CGEventTapProxy, ty: CGEventType, ev: &CGEvent) 
         }
     }
     // excluded app (Terminal, IDE...): stay out of the way, but hot keys above still work
-    if app.front_excluded() {
-        return Outcome::Pass;
-    }
-
-    let is_mouse = [
-        CGEventType::LeftMouseDown,
-        CGEventType::RightMouseDown,
-        CGEventType::LeftMouseDragged,
-        CGEventType::RightMouseDragged,
-    ]
-    .contains(&ty);
-    if ty != CGEventType::KeyDown && ty != CGEventType::KeyUp && !is_mouse {
+    if app.front_excluded() || ty != CGEventType::KeyDown {
         return Outcome::Pass;
     }
     app.tap.proxy = proxy;
     let flag = app.tap.flag;
+    let kc = app.tap.keycode;
     let shift = has(flag, CGEventFlags::MaskShift);
     // Case of the character the OS will actually type, not the modifier flags.
     let caps = match ch {
@@ -441,22 +393,24 @@ fn handle(app: &mut App, proxy: CGEventTapProxy, ty: CGEventType, ev: &CGEvent) 
         None => shift,
     };
     let caps_status = if !caps { 0 } else if shift { 1 } else { 2 };
+    // the typed key, as the OS would have typed it, when the engine gives it back
+    let typed = if key_to_char(kc as u32) == 0 {
+        Typed::Control
+    } else {
+        match ch {
+            Some(c) if !c.is_control() && (c as u32) <= 0xFFFF => Typed::Char(c as u16),
+            _ => Typed::Char(key_to_char(kc as u32 | if caps { CAPS_MASK } else { 0 })),
+        }
+    };
 
     if app.engine.s.language == 0 {
-        if app.engine.s.use_macro && app.engine.s.use_macro_in_english && ty == CGEventType::KeyDown {
-            let kc = app.tap.keycode;
+        if app.engine.s.use_macro && app.engine.s.use_macro_in_english {
             app.engine.english_mode(KeyState::KeyDown, kc, caps, other_control_key(flag));
             if app.engine.hook.code == Code::ReplaceMacro {
-                handle_macro(app, caps);
+                output(app, Typed::Printable);
                 return Outcome::Swallow;
             }
         }
-        return Outcome::Pass;
-    }
-
-    if is_mouse {
-        app.engine.handle_event(KeyEvent::Mouse, KeyState::MouseDown, 0, 0, false);
-        app.tap.clear_sync();
         return Outcome::Pass;
     }
 
@@ -464,170 +418,57 @@ fn handle(app: &mut App, proxy: CGEventTapProxy, ty: CGEventType, ev: &CGEvent) 
         return Outcome::Pass;
     }
 
-    if ty != CGEventType::KeyDown {
-        return Outcome::Pass;
-    }
-
-    let kc = app.tap.keycode;
     // Esc right after a word was changed: give the typed keys back instead of the Esc
     let undone = kc == KEY_ESC && app.opt.esc_undo && !other_control_key(flag) && app.engine.undo_word();
     if !undone {
         app.engine.handle_event(KeyEvent::Keyboard, KeyState::KeyDown, kc, caps_status, other_control_key(flag));
     }
-    let table = app.engine.s.code_table;
-    let double = is_double_code(table);
-    let compound_app = Tap::uses_compound_workaround(app);
-
     match app.engine.hook.code {
         Code::DoNothing => {
-            if double {
-                let t = &mut app.tap;
-                match app.engine.hook.ext_code {
-                    1 => t.sync_key.clear(),
-                    2 => {
-                        if let Some(&last) = t.sync_key.last() {
-                            if last > 1 && (table == 2 || !compound_app) {
-                                t.post_key(KEY_DELETE, None);
-                            }
-                            t.sync_key.pop();
-                        }
-                    }
-                    3 => t.sync_key.push(1),
-                    _ => {}
-                }
-            }
+            output(app, typed);
             Outcome::Pass
         }
-        Code::WillProcess | Code::Restore | Code::RestoreAndStartNewSession => {
-            let front = app.front_app.clone();
-            let mut bs = app.engine.hook.backspace_count;
-            if should_use_recommend_workaround(app) && app.engine.hook.ext_code != 4 {
-                if app.opt.fix_chromium_browser && CHROMIUM_APPS.contains(&front.as_str()) {
-                    if bs > 0 {
-                        app.tap.shift_left(double, compound_app, table);
-                        if bs == 1 {
-                            bs = 0;
-                        }
-                    }
-                } else {
-                    app.tap.empty_char(double, &front);
-                    bs += 1;
-                }
-            }
-            if bs > 0 && (front == SPOTLIGHT || app.tap.spotlight()) {
-                for _ in 0..bs {
-                    app.tap.shift_left(double, compound_app, table);
-                }
-                bs = 0;
-            }
-            if bs > 0 && bs < crate::engine::MAX_BUFF as i32 {
-                for _ in 0..bs {
-                    app.tap.backspace(double, compound_app, table);
-                }
-            }
-            // the typed key, as the OS would have typed it (None: control key like tab)
-            let typed = (key_to_char(kc as u32) != 0).then(|| match ch {
-                Some(c) if !c.is_control() && (c as u32) <= 0xFFFF => c as u16,
-                _ => key_to_char(kc as u32 | if caps { CAPS_MASK } else { 0 }),
-            });
-            send_new_chars(app, typed);
-            Outcome::Swallow
-        }
+        // the macro's trigger key (space, punctuation) is sent again as a key
         Code::ReplaceMacro => {
-            handle_macro(app, caps);
+            output(app, Typed::Printable);
             Outcome::Swallow
         }
-        Code::BreakWord => Outcome::Pass,
+        _ => {
+            output(app, typed);
+            Outcome::Swallow
+        }
     }
 }
 
-fn should_use_recommend_workaround(app: &mut App) -> bool {
-    if !app.opt.fix_recommend_browser || app.front_app == SPOTLIGHT {
-        return false;
-    }
-    !app.tap.spotlight()
-}
-
-/// Send the engine's new characters (and the typed key when restoring).
-fn send_new_chars(app: &mut App, typed: Option<u16>) {
-    let table = app.engine.s.code_table;
-    let double = is_double_code(table);
-    let h = &app.engine.hook;
-    let code = h.code;
-    let mut chars: Vec<Vec<u16>> = Vec::new();
-    let mut lens: Vec<u8> = Vec::new();
-    for i in (0..h.new_char_count.clamp(0, crate::engine::MAX_BUFF as i32) as usize).rev() {
-        let mut u = Vec::new();
-        lens.push(encode_output(h.char_data[i], table, &mut u));
-        chars.push(u);
-    }
-    let restore = matches!(code, Code::Restore | Code::RestoreAndStartNewSession);
-    let mut send_control_key = false;
-    if restore {
-        match typed {
-            Some(c) => {
-                chars.push(vec![c]);
-                lens.push(1);
-            }
-            None => send_control_key = true,
+/// Send what the engine's last result needs on screen.
+fn output(app: &mut App, typed: Typed) {
+    let code = app.engine.hook.code;
+    if code == Code::ReplaceMacro {
+        if let Some(name) = app.engine.last_macro.take() {
+            crate::stats::record_macro(&name);
         }
     }
-    if code == Code::RestoreAndStartNewSession {
-        app.engine.start_new_session();
-    }
-    let t = &mut app.tap;
-    if double {
-        t.sync_key.extend_from_slice(&lens);
-    }
-    if app.opt.send_key_step_by_step {
-        for c in &chars {
-            t.post_units(c);
+    let front = app.front_app.as_str();
+    let mut ctx = Ctx {
+        grapheme_delete: UNICODE_COMPOUND_APPS.iter().any(|p| front.starts_with(p)),
+        step_by_step: app.opt.send_key_step_by_step,
+        empty_char: if NICE_SPACE_APPS.contains(&front) { 0x200C } else { 0x202F },
+        ..Ctx::default()
+    };
+    // Spotlight is checked only when something is rewritten (the check is not free)
+    if code != Code::DoNothing {
+        let spotlight = front == SPOTLIGHT || sys::is_spotlight_visible();
+        ctx.select_instead_of_delete = spotlight;
+        if app.opt.fix_recommend_browser && !spotlight {
+            ctx.browser_fix = if app.opt.fix_chromium_browser && CHROMIUM_APPS.contains(&front) && code != Code::ReplaceMacro {
+                BrowserFix::SelectLeft
+            } else {
+                BrowserFix::EmptyChar
+            };
         }
-    } else {
-        t.post_string(&chars);
     }
-    // invalid word ended with a control key (tab, arrows...): send that key too
-    if send_control_key {
-        t.post_key(t.keycode, Some(CGEventFlags::MaskNonCoalesced.0));
-    }
-}
-
-fn handle_macro(app: &mut App, shift: bool) {
-    if let Some(name) = app.engine.last_macro.take() {
-        crate::stats::record_macro(&name);
-    }
-    let table = app.engine.s.code_table;
-    let double = is_double_code(table);
-    let compound_app = Tap::uses_compound_workaround(app);
-    let front = app.front_app.clone();
-    let mut bs = app.engine.hook.backspace_count;
-    if should_use_recommend_workaround(app) {
-        app.tap.empty_char(double, &front);
-        bs += 1;
-    }
-    for _ in 0..bs.max(0) {
-        app.tap.backspace(double, compound_app, table);
-    }
-    let mut chars: Vec<Vec<u16>> = Vec::new();
-    for &c in &app.engine.hook.macro_data {
-        let mut u = Vec::new();
-        let l = encode_output(c, table, &mut u);
-        if double {
-            app.tap.sync_key.push(l);
-        }
-        chars.push(u);
-    }
-    let t = &mut app.tap;
-    if app.opt.send_key_step_by_step {
-        for c in &chars {
-            t.post_units(c);
-        }
-    } else {
-        t.post_string(&chars);
-    }
-    // re-send the key that triggered the macro (space, punctuation)
-    let shift_flag = if shift { CGEventFlags::MaskShift.0 } else { 0 };
-    t.post_key(t.keycode, Some(shift_flag | CGEventFlags::MaskNonCoalesced.0));
+    let steps = app.tap.out.plan(&mut app.engine, &ctx, typed);
+    app.tap.run(&steps);
 }
 
 fn switch_language(app: &mut App) {

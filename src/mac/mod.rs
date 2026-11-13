@@ -77,6 +77,8 @@ pub struct App {
     pub front_name: String,
     /// bundle ids of the apps where VKeyEngine stays out of the way
     pub excluded: Vec<String>,
+    /// the front app is excluded (worked out when the app or the list changes, not per key)
+    front_is_excluded: bool,
     pub english_input_source: bool,
 }
 
@@ -162,6 +164,7 @@ impl App {
             front_app: String::new(),
             front_name: String::new(),
             excluded: lines(&prefs::data("ExcludedApps")),
+            front_is_excluded: false,
             english_input_source: sys::input_source_is_english(),
         }
     }
@@ -183,9 +186,16 @@ impl App {
         self.opt = opt;
     }
 
+    /// The caret may have moved without us seeing it (focus change, click, missed keys):
+    /// nothing on screen may be edited any more.
+    pub fn forget_screen(&mut self) {
+        self.engine.reset();
+        self.tap.clear_sync();
+    }
+
     /// Keys go through untouched in the frontmost app (it is in the exclusion list).
     pub fn front_excluded(&self) -> bool {
-        crate::exclude::is_excluded(&self.excluded, &self.front_app)
+        self.front_is_excluded
     }
 
     /// Vietnamese is on but the front app is a remote desktop client we stay out of.
@@ -200,11 +210,11 @@ impl App {
         }
         crate::exclude::toggle(&mut self.excluded, &self.front_app);
         self.save_excluded();
-        self.engine.start_new_session();
-        self.tap.clear_sync();
+        self.forget_screen();
     }
 
-    pub fn save_excluded(&self) {
+    pub fn save_excluded(&mut self) {
+        self.front_is_excluded = crate::exclude::is_excluded(&self.excluded, &self.front_app);
         prefs::set_data("ExcludedApps", self.excluded.join("\n").as_bytes());
     }
 
@@ -235,7 +245,7 @@ impl App {
     }
 
     fn on_language_changed(&mut self) {
-        self.engine.start_new_session();
+        self.forget_screen(); // also the per-character lengths: English types none
         if self.opt.use_smart_switch_key {
             self.save_smart();
         }
@@ -269,8 +279,8 @@ impl App {
         }
         self.front_name = app.localizedName().map(|s| s.to_string()).unwrap_or_else(|| id.clone());
         self.front_app = id;
-        self.engine.start_new_session();
-        self.tap.clear_sync();
+        self.front_is_excluded = crate::exclude::is_excluded(&self.excluded, &self.front_app);
+        self.forget_screen();
         // excluded app: keys go through anyway, and a language remembered for it (e.g. English
         // for a remote desktop client, from before it was excluded) would only hide that
         if self.front_excluded() {
