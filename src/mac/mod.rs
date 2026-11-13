@@ -271,6 +271,11 @@ impl App {
         self.front_app = id;
         self.engine.start_new_session();
         self.tap.clear_sync();
+        // excluded app: keys go through anyway, and a language remembered for it (e.g. English
+        // for a remote desktop client, from before it was excluded) would only hide that
+        if self.front_excluded() {
+            return;
+        }
         // either option alone must work (before, "remember code table" needed smart switch on)
         if !self.opt.use_smart_switch_key && !self.opt.remember_code {
             return;

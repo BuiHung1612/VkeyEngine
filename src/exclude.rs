@@ -12,7 +12,7 @@ const REMOTE_APPS: &[&str] = &[
     "com.microsoft.rdc.mac",
     "com.apple.screensharing",
     "com.realvnc.vncviewer",
-    "com.carriez.flutterhbb", // RustDesk
+    "com.carriez.rustdesk",
     "tv.parsec.www",
     "mstsc.exe",
     "msrdc.exe",

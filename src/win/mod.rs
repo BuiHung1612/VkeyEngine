@@ -253,6 +253,11 @@ impl App {
         self.engine.start_new_session();
         self.engine.temp_off_engine(false);
         self.hook.sync_key.clear();
+        // excluded app: keys go through anyway, and a language remembered for it (e.g. English
+        // for a remote desktop client, from before it was excluded) would only hide that
+        if self.front_excluded() {
+            return;
+        }
         if !self.opt.use_smart_switch_key && !self.opt.remember_code {
             return;
         }
