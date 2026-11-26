@@ -104,7 +104,7 @@ fn macro_engine(s: Settings, defs: &[(&str, &str)]) -> Engine {
     let mut e = Engine::new(s);
     for (k, v) in defs {
         let t = e.s.code_table;
-        e.macros.add(k, v, t);
+        e.macros.add(k, v, t).unwrap();
     }
     e
 }
@@ -174,7 +174,7 @@ fn macro_binary_roundtrip() {
     m.load_binary(&bin, 0);
     assert_eq!(m.all(), e.macros.all());
     let mut m2 = vkeyengine::macros::Macros::default();
-    m2.import_text(&e.macros.export_text(), false, 0);
+    m2.import_text(&e.macros.export_text(), false, 0).unwrap();
     assert_eq!(m2.all(), e.macros.all());
 }
 
@@ -262,14 +262,14 @@ fn undo_word_gives_the_keys_back() {
 fn macro_packs_add_free_names_only() {
     use vkeyengine::macros::PACKS;
     let mut e = Engine::new(Settings::default());
-    e.macros.add("ko", "khong", 0); // the user's own one stays
-    let n = e.macros.add_pack(&PACKS[2], 0);
+    e.macros.add("ko", "khong", 0).unwrap(); // the user's own one stays
+    let n = e.macros.add_pack(&PACKS[2], 0).unwrap();
     assert_eq!(n, PACKS[2].items.len() - 1);
-    assert_eq!(e.macros.add_pack(&PACKS[2], 0), 0, "adding again changes nothing");
+    assert_eq!(e.macros.add_pack(&PACKS[2], 0).unwrap(), 0, "adding again changes nothing");
     assert_eq!(type_with(&mut e, "ko "), "khong ");
     assert_eq!(type_with(&mut e, "ntn "), "như thế nào ");
-    e.macros.add_pack(&PACKS[0], 0);
-    e.macros.add_pack(&PACKS[1], 0);
+    e.macros.add_pack(&PACKS[0], 0).unwrap();
+    e.macros.add_pack(&PACKS[1], 0).unwrap();
     assert_eq!(type_with(&mut e, ":) "), "😊 ");
     assert_eq!(type_with(&mut e, "-> "), "→ ");
 }
@@ -349,5 +349,43 @@ fn empty_char_fix_types_the_same_text() {
         let s = Settings { code_table: table, ..Settings::default() };
         let got = type_with_ctx(&mut Engine::new(s.clone()), "vieejt\x08\x08ieet", &ctx).replace('\u{202F}', "");
         assert_eq!(got, type_with(&mut Engine::new(s), "vieejt\x08\x08ieet"), "table {table}");
+    }
+}
+
+#[test]
+fn long_macro_output_preserves_characters_and_event_boundaries() {
+    use vkeyengine::output::{Output, Step, Typed};
+    use vkeyengine::tables::{KEY_SPACE, KEY_Z};
+    let content = format!("{}😊{}", "a".repeat(15), "Việt Nam 🇻🇳 ".repeat(100));
+    for step_by_step in [false, true] {
+        let mut e = macro_engine(Settings::default(), &[("zz", &content)]);
+        for key in [KEY_Z, KEY_Z, KEY_SPACE] {
+            e.handle_event(KeyEvent::Keyboard, KeyState::KeyDown, key, 0, false);
+        }
+        assert_eq!(e.hook.code, Code::ReplaceMacro);
+        let ctx = Ctx { step_by_step, ..Ctx::default() };
+        let steps = Output::default().plan(&mut e, &ctx, Typed::Printable);
+        assert_eq!(steps.last(), Some(&Step::Key));
+        let mut text = Vec::new();
+        for step in steps {
+            if let Step::Text(units) = step {
+                assert!(units.len() <= 16);
+                let chunk = String::from_utf16(&units).expect("an event must not split a surrogate pair");
+                if step_by_step {
+                    assert_eq!(chunk.chars().count(), 1);
+                }
+                text.extend(units);
+            }
+        }
+        assert_eq!(String::from_utf16(&text).unwrap(), content);
+    }
+    for table in 0..=4 {
+        let s = Settings { code_table: table, ..Settings::default() };
+        let input = "vv \x08\x08";
+        assert_eq!(
+            type_with_ctx(&mut macro_engine(s.clone(), &[("vv", "Việt Nam")]), input, &Ctx { step_by_step: true, ..Ctx::default() }),
+            type_with(&mut macro_engine(s, &[("vv", "Việt Nam")]), input),
+            "table {table}"
+        );
     }
 }

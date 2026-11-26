@@ -1292,13 +1292,7 @@ fn add_pack(hwnd: HWND, i: usize) {
     if !confirm(hwnd, &msg) {
         return;
     }
-    let added = with_app(|a| {
-        let t = a.engine.s.code_table;
-        let n = a.engine.macros.add_pack(pack, t);
-        a.save_macros();
-        n
-    })
-    .unwrap_or(0);
+    let Some(added) = edit_macros(hwnd, |macros, table| macros.add_pack(pack, table)) else { return };
     if let Some(m) = find_kind(Kind::Macros) {
         reload_macro_rows(m);
     }
@@ -2390,17 +2384,43 @@ fn clear_macro_fields(hwnd: HWND) {
     unsafe { SetFocus(GetDlgItem(hwnd, ID_NAME as i32)) };
 }
 
+/// Build and serialize outside APP's lock so the keyboard hook can keep running.
+fn edit_macros<R>(hwnd: HWND, edit: impl Fn(&mut crate::macros::Macros, u8) -> Result<R, &'static str>) -> Option<R> {
+    loop {
+        let (mut macros, table) = with_app(|a| (a.engine.macros.clone(), a.engine.s.code_table))?;
+        let result = match edit(&mut macros, table) {
+            Ok(result) => result,
+            Err(e) => {
+                alert(hwnd, e);
+                return None;
+            }
+        };
+        let bytes = macros.save_binary();
+        let swapped = with_app(|a| {
+            // The foreground app can change its code table on the hook thread meanwhile.
+            if a.engine.s.code_table == table {
+                Ok(std::mem::replace(&mut a.engine.macros, macros))
+            } else {
+                Err(macros)
+            }
+        })?;
+        if let Ok(old) = swapped {
+            drop(old);
+            reg::set_data("macroData", &bytes);
+            return Some(result);
+        }
+    }
+}
+
 fn macro_add(hwnd: HWND) {
     let (name, content) = (get_text(hwnd, ID_NAME), get_text(hwnd, ID_CONTENT));
     if name.is_empty() || content.is_empty() {
         alert(hwnd, "Bạn hãy nhập từ gõ tắt và nội dung!");
         return;
     }
-    with_app(|a| {
-        let t = a.engine.s.code_table;
-        a.engine.macros.add(&name, &content, t);
-        a.save_macros();
-    });
+    if edit_macros(hwnd, |macros, table| macros.add(&name, &content, table)).is_none() {
+        return;
+    }
     clear_macro_fields(hwnd);
     reload_macro_rows(hwnd);
 }
@@ -2411,12 +2431,9 @@ fn macro_delete(hwnd: HWND) {
         alert(hwnd, "Bạn hãy chọn từ cần xoá!");
         return;
     }
-    with_app(|a| {
-        let t = a.engine.s.code_table;
-        if a.engine.macros.delete(&name, t) {
-            a.save_macros();
-        }
-    });
+    if edit_macros(hwnd, |macros, table| Ok(macros.delete(&name, table))).is_none() {
+        return;
+    }
     clear_macro_fields(hwnd);
     reload_macro_rows(hwnd);
 }
@@ -2446,16 +2463,14 @@ fn file_dialog(hwnd: HWND, save: bool) -> Option<String> {
 
 fn macro_import(hwnd: HWND) {
     let Some(path) = file_dialog(hwnd, false) else { return };
-    let text = match std::fs::read(&path) {
-        Ok(b) => String::from_utf8_lossy(&b).into_owned(),
+    let text = match std::fs::read_to_string(&path) {
+        Ok(text) => text,
         Err(e) => return alert(hwnd, &format!("Không đọc được file\n{e}")),
     };
     let keep = confirm(hwnd, "Bạn có muốn giữ lại các dữ liệu gõ tắt hiện tại không?");
-    with_app(|a| {
-        let t = a.engine.s.code_table;
-        a.engine.macros.import_text(&text, keep, t);
-        a.save_macros();
-    });
+    if edit_macros(hwnd, |macros, table| macros.import_text(&text, keep, table)).is_none() {
+        return;
+    }
     reload_macro_rows(hwnd);
 }
 

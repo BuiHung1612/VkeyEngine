@@ -114,4 +114,42 @@ mod tests {
         assert_eq!(r.asset.as_deref(), Some("https://github.com/x/y/releases/download/v1.0.2/VKeyEngine-windows-x64.exe"));
         assert_eq!(parse_release(json, "other.zip").unwrap().asset, None);
     }
+
+    #[cfg(unix)]
+    #[test]
+    fn macos_swap_rolls_back_failed_moves_and_launches() {
+        use std::fs;
+        use std::os::unix::fs::PermissionsExt;
+        for failure in ["none", "move-old", "move-new", "open-new"] {
+            let nonce = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+            let root = std::env::temp_dir().join(format!("vkey-swap-{}-{nonce}", std::process::id()));
+            let bin = root.join("bin");
+            let app = root.join("VKey Engine.app");
+            let new = root.join("staged.app");
+            let backup = app.with_extension("app.old");
+            fs::create_dir_all(&bin).unwrap();
+            fs::create_dir(&app).unwrap();
+            fs::create_dir(&new).unwrap();
+            fs::write(app.join("marker"), "old").unwrap();
+            fs::write(new.join("marker"), "new").unwrap();
+            fs::write(bin.join("mv"), "#!/bin/sh\n[ \"$1\" = \"$FAIL_MOVE_SOURCE\" ] && exit 1\nexec /bin/mv \"$@\"\n").unwrap();
+            fs::write(bin.join("open"), "#!/bin/sh\n[ \"$FAIL_OPEN_NEW\" = 1 ] && [ \"$(cat \"$1/marker\")\" = new ] && exit 1\nexit 0\n").unwrap();
+            for name in ["mv", "open"] {
+                fs::set_permissions(bin.join(name), fs::Permissions::from_mode(0o755)).unwrap();
+            }
+            let status = Command::new("/bin/sh")
+                .args(["-c", include_str!("../macos/update.sh"), "sh", "2147483647"])
+                .arg(&app).arg(&new)
+                .env("PATH", format!("{}:/usr/bin:/bin", bin.display()))
+                .env("FAIL_MOVE_SOURCE", match failure { "move-old" => app.as_os_str(), "move-new" => new.as_os_str(), _ => std::ffi::OsStr::new("") })
+                .env("FAIL_OPEN_NEW", if failure == "open-new" { "1" } else { "0" })
+                .status().unwrap();
+            assert_eq!(status.success(), failure == "none", "{failure}");
+            assert_eq!(fs::read_to_string(app.join("marker")).unwrap(), if failure == "none" { "new" } else { "old" }, "{failure}");
+            if failure == "none" {
+                assert_eq!(fs::read_to_string(backup.join("marker")).unwrap(), "old");
+            }
+            fs::remove_dir_all(root).unwrap();
+        }
+    }
 }

@@ -136,23 +136,18 @@ impl Output {
                     }
                 }
                 let h = &e.hook;
-                let mut chars: Vec<Vec<u16>> = Vec::new();
-                for i in (0..h.new_char_count.clamp(0, MAX_BUFF as i32) as usize).rev() {
-                    let mut u = Vec::new();
-                    let l = encode_output(h.char_data[i], table, &mut u);
-                    if double {
-                        self.sync_key.push(l);
-                    }
-                    chars.push(u);
-                }
+                let mut text = self.text(
+                    (0..h.new_char_count.clamp(0, MAX_BUFF as i32) as usize).rev().map(|i| h.char_data[i]),
+                    table, ctx, &mut steps,
+                );
                 let restore = matches!(h.code, Code::Restore | Code::RestoreAndStartNewSession);
                 if h.code == Code::RestoreAndStartNewSession {
                     e.start_new_session();
                 }
                 if restore {
-                    self.typed(typed, double, &mut chars, ctx, &mut steps);
+                    self.typed(typed, double, &mut text, ctx, &mut steps);
                 } else {
-                    push_text(&chars, ctx, &mut steps);
+                    flush_text(&mut text, &mut steps);
                 }
             }
             Code::ReplaceMacro => {
@@ -164,28 +159,35 @@ impl Output {
                 for _ in 0..bs.max(0) {
                     self.delete_char(double, table, ctx, &mut steps);
                 }
-                let mut chars: Vec<Vec<u16>> = Vec::new();
-                for &c in &e.hook.macro_data {
-                    let mut u = Vec::new();
-                    let l = encode_output(c, table, &mut u);
-                    if double {
-                        self.sync_key.push(l);
-                    }
-                    chars.push(u);
-                }
+                let mut text = self.text(e.hook.macro_data.iter().copied(), table, ctx, &mut steps);
                 // the key that triggered the macro (space, punctuation, Enter)
-                self.typed(typed, double, &mut chars, ctx, &mut steps);
+                self.typed(typed, double, &mut text, ctx, &mut steps);
             }
         }
         steps
     }
 
-    /// `chars` followed by the typed key.
-    fn typed(&mut self, typed: Typed, double: bool, chars: &mut Vec<Vec<u16>>, ctx: &Ctx, steps: &mut Vec<Step>) {
-        if let Typed::Char(c) = typed {
-            chars.push(vec![c]);
+    /// Encode into event chunks without allocating a buffer for every character.
+    fn text(&mut self, codes: impl Iterator<Item = u32>, table: u8, ctx: &Ctx, steps: &mut Vec<Step>) -> Vec<u16> {
+        let mut text = Vec::new();
+        let mut units = Vec::with_capacity(2);
+        for code in codes {
+            units.clear();
+            let len = encode_output(code, table, &mut units);
+            if is_double_code(table) {
+                self.sync_key.push(len);
+            }
+            push_text(&units, &mut text, ctx, steps);
         }
-        push_text(chars, ctx, steps);
+        text
+    }
+
+    /// Output text followed by the typed key.
+    fn typed(&mut self, typed: Typed, double: bool, text: &mut Vec<u16>, ctx: &Ctx, steps: &mut Vec<Step>) {
+        if let Typed::Char(c) = typed {
+            push_text(&[c], text, ctx, steps);
+        }
+        flush_text(text, steps);
         match typed {
             Typed::Char(_) | Typed::Printable if double => self.sync_key.push(1),
             Typed::Control => {
@@ -232,16 +234,19 @@ fn two_presses(len: u8, table: u8, ctx: &Ctx) -> bool {
     len > 1 && (table == 2 || !ctx.grapheme_delete)
 }
 
-/// Text steps for `chars`: one per character, or in chunks that never split a character.
-fn push_text(chars: &[Vec<u16>], ctx: &Ctx, steps: &mut Vec<Step>) {
-    let mut buf: Vec<u16> = Vec::new();
-    for c in chars {
-        if (ctx.step_by_step || buf.len() + c.len() > MAX_UNITS_PER_EVENT) && !buf.is_empty() {
-            steps.push(Step::Text(std::mem::take(&mut buf)));
-        }
-        buf.extend_from_slice(c);
+/// Append a whole character, flushing before it would cross an event boundary.
+fn push_text(units: &[u16], text: &mut Vec<u16>, ctx: &Ctx, steps: &mut Vec<Step>) {
+    if ctx.step_by_step || text.len() + units.len() > MAX_UNITS_PER_EVENT {
+        flush_text(text, steps);
     }
-    if !buf.is_empty() {
-        steps.push(Step::Text(buf));
+    if text.is_empty() {
+        text.reserve_exact(if ctx.step_by_step { units.len() } else { MAX_UNITS_PER_EVENT });
+    }
+    text.extend_from_slice(units);
+}
+
+fn flush_text(text: &mut Vec<u16>, steps: &mut Vec<Step>) {
+    if !text.is_empty() {
+        steps.push(Step::Text(std::mem::take(text)));
     }
 }

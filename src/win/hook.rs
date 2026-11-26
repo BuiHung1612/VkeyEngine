@@ -161,11 +161,9 @@ unsafe extern "system" fn keyboard_proc(code: i32, wparam: WPARAM, lparam: LPARA
         return next(); // whatever we send would be blocked, so leave the key alone
     }
     let msg = wparam as u32;
-    if other_ime_open(msg == WM_KEYDOWN || msg == WM_SYSKEYDOWN) {
-        return next();
-    }
     let started = std::time::Instant::now();
-    let swallow = guarded(|a| handle_key(a, msg, k.vkCode as u16)).unwrap_or(false);
+    let swallow = !other_ime_open(msg == WM_KEYDOWN || msg == WM_SYSKEYDOWN)
+        && guarded(|a| handle_key(a, msg, k.vkCode as u16)).unwrap_or(false);
     if msg == WM_KEYDOWN || msg == WM_SYSKEYDOWN {
         crate::stats::record_key(started.elapsed());
     }

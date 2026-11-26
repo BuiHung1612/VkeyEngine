@@ -208,10 +208,6 @@ impl App {
         reg::set_data("ExcludedApps", self.excluded.join("\n").as_bytes());
     }
 
-    pub fn save_macros(&self) {
-        reg::set_data("macroData", &self.engine.macros.save_binary());
-    }
-
     fn smart_value(&self) -> i8 {
         (self.engine.s.language | (self.engine.s.code_table << 1)) as i8
     }

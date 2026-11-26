@@ -1207,11 +1207,15 @@ fn add_pack(i: usize) {
     }
     let added = with_app(|a| {
         let t = a.engine.s.code_table;
-        let n = a.engine.macros.add_pack(pack, t);
+        let n = a.engine.macros.add_pack(pack, t)?;
         a.save_macros();
-        n
+        Ok(n)
     })
-    .unwrap_or(0);
+    .unwrap_or(Ok(0));
+    let added = match added {
+        Ok(n) => n,
+        Err(e) => return alert("Gõ tắt", e),
+    };
     reload_macro_rows();
     let msg = if added == 0 { "Bạn đã có đủ các gõ tắt của gói này.".to_string() } else { format!("Đã thêm {added} gõ tắt.") };
     alert("Gói gõ tắt", &msg);
@@ -2013,11 +2017,15 @@ fn macro_add() {
         alert("Gõ tắt", "Bạn hãy nhập từ gõ tắt và nội dung!");
         return;
     }
-    with_app(|a| {
+    let result = with_app(|a| {
         let t = a.engine.s.code_table;
-        a.engine.macros.add(&name, &content, t);
+        a.engine.macros.add(&name, &content, t)?;
         a.save_macros();
+        Ok(())
     });
+    if let Some(Err(e)) = result {
+        return alert("Gõ tắt", e);
+    }
     clear_macro_fields();
     reload_macro_rows();
 }
@@ -2050,16 +2058,20 @@ fn macro_import() {
         return;
     }
     let Some(path) = panel.URL().and_then(|u| u.path()) else { return };
-    let text = match std::fs::read(path.to_string()) {
-        Ok(b) => String::from_utf8_lossy(&b).into_owned(),
+    let text = match std::fs::read_to_string(path.to_string()) {
+        Ok(text) => text,
         Err(e) => return alert("Không đọc được file", &e.to_string()),
     };
     let keep = confirm("Dữ liệu gõ tắt", "Bạn có muốn giữ lại các dữ liệu hiện tại không?");
-    with_app(|a| {
+    let result = with_app(|a| {
         let t = a.engine.s.code_table;
-        a.engine.macros.import_text(&text, keep, t);
+        a.engine.macros.import_text(&text, keep, t)?;
         a.save_macros();
+        Ok(())
     });
+    if let Some(Err(e)) = result {
+        return alert("Không nhập được gõ tắt", e);
+    }
     reload_macro_rows();
 }
 
@@ -2114,6 +2126,11 @@ fn post_update_event(e: UpdateEvent) {
 fn start_update_checks() {
     std::thread::spawn(|| {
         std::thread::sleep(std::time::Duration::from_secs(10));
+        if let Ok(exe) = std::env::current_exe() {
+            if let Some(app) = exe.ancestors().nth(3).filter(|p| p.extension().is_some_and(|e| e == "app")) {
+                let _ = std::fs::remove_dir_all(app.with_extension("app.old"));
+            }
+        }
         loop {
             if prefs::flag("CheckUpdate", true) {
                 check_update(false);
@@ -2184,9 +2201,7 @@ fn install_update(url: &str) {
         if !unpacked.is_ok_and(|s| s.success()) || !new_app.join("Contents/MacOS/VKeyEngine").exists() {
             return Err("tệp tải về bị lỗi".into());
         }
-        let script = r#"while kill -0 "$1" 2>/dev/null; do sleep 0.2; done
-rm -rf "$2.old" && mv "$2" "$2.old" && mv "$3" "$2" && rm -rf "$2.old"
-open "$2""#;
+        let script = include_str!("../../macos/update.sh");
         use std::os::unix::process::CommandExt;
         std::process::Command::new("/bin/sh")
             .args(["-c", script, "sh"])

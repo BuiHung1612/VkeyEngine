@@ -9,6 +9,7 @@
 use crate::engine::char_code;
 use crate::tables::*;
 use std::collections::BTreeMap;
+use std::sync::Arc;
 
 #[derive(Clone, Debug)]
 pub struct MacroData {
@@ -17,9 +18,10 @@ pub struct MacroData {
     pub content_code: Vec<u32>,
 }
 
-#[derive(Default)]
+#[derive(Default, Clone)]
 pub struct Macros {
-    map: BTreeMap<Vec<u32>, MacroData>,
+    // Snapshots for UI edits must not copy a large dictionary while holding the hook lock.
+    map: Arc<BTreeMap<Vec<u32>, Arc<MacroData>>>,
 }
 
 fn convert(s: &str, code_table: u8) -> Vec<u32> {
@@ -143,7 +145,7 @@ impl Macros {
     /// Binary format (NSUserDefaults "macroData"): u16 count, then for each macro:
     /// u8 text length, text bytes, u16 content length, content bytes (all little endian, UTF-8).
     pub fn load_binary(&mut self, data: &[u8], code_table: u8) {
-        self.map.clear();
+        self.map = Arc::default();
         let mut cur = 0usize;
         let take = |cur: &mut usize, n: usize| -> Option<&[u8]> {
             let s = data.get(*cur..*cur + n)?;
@@ -161,17 +163,19 @@ impl Macros {
             let Some(content) = take(&mut cur, cl as usize).map(|b| String::from_utf8_lossy(b).into_owned()) else {
                 return;
             };
-            self.add(&text, &content, code_table);
+            if self.add(&text, &content, code_table).is_err() {
+                return;
+            }
         }
     }
 
     pub fn save_binary(&self) -> Vec<u8> {
         let mut out = (self.map.len() as u16).to_le_bytes().to_vec();
         for m in self.map.values() {
-            let t = truncate_utf8(&m.text, u8::MAX as usize);
+            let t = &m.text;
             out.push(t.len() as u8);
             out.extend_from_slice(t.as_bytes());
-            let c = truncate_utf8(&m.content, u16::MAX as usize);
+            let c = &m.content;
             out.extend_from_slice(&(c.len() as u16).to_le_bytes());
             out.extend_from_slice(c.as_bytes());
         }
@@ -222,15 +226,17 @@ impl Macros {
     }
 
     /// Add the macros of a pack whose names are free; returns how many were added.
-    pub fn add_pack(&mut self, pack: &Pack, code_table: u8) -> usize {
+    pub fn add_pack(&mut self, pack: &Pack, code_table: u8) -> Result<usize, &'static str> {
+        let mut next = self.clone();
         let mut added = 0;
         for (name, content) in pack.items {
-            if !self.has(name, code_table) {
-                self.add(name, content, code_table);
+            if !next.has(name, code_table) {
+                next.add(name, content, code_table)?;
                 added += 1;
             }
         }
-        added
+        *self = next;
+        Ok(added)
     }
 
     pub fn has(&self, name: &str, code_table: u8) -> bool {
@@ -242,26 +248,37 @@ impl Macros {
         self.map.values().map(|m| (m.text.clone(), m.content.clone())).collect()
     }
 
-    pub fn add(&mut self, text: &str, content: &str, code_table: u8) {
+    pub fn add(&mut self, text: &str, content: &str, code_table: u8) -> Result<(), &'static str> {
+        if text.is_empty() || text.len() > u8::MAX as usize {
+            return Err("Tên gõ tắt phải có từ 1 đến 255 byte UTF-8.");
+        }
+        if content.len() > u16::MAX as usize {
+            return Err("Nội dung gõ tắt không được vượt quá 65.535 byte UTF-8.");
+        }
         let key = convert(text, code_table);
+        if self.map.len() == u16::MAX as usize && !self.map.contains_key(&key) {
+            return Err("Danh sách không được vượt quá 65.535 gõ tắt.");
+        }
         let content_code = convert(content, code_table);
-        let entry = self.map.entry(key).or_insert_with(|| MacroData {
+        let entry = Arc::make_mut(&mut self.map).entry(key).or_insert_with(|| Arc::new(MacroData {
             text: text.to_string(),
             content: String::new(),
             content_code: Vec::new(),
-        });
+        }));
+        let entry = Arc::make_mut(entry);
         entry.content = content.to_string();
         entry.content_code = content_code;
+        Ok(())
     }
 
     pub fn delete(&mut self, text: &str, code_table: u8) -> bool {
-        self.map.remove(&convert(text, code_table)).is_some()
+        Arc::make_mut(&mut self.map).remove(&convert(text, code_table)).is_some()
     }
 
     pub fn on_code_table_change(&mut self, code_table: u8) {
         let old = std::mem::take(&mut self.map);
-        for m in old.into_values() {
-            self.add(&m.text, &m.content, code_table);
+        for m in old.values() {
+            self.add(&m.text, &m.content, code_table).expect("validated macro");
         }
     }
 
@@ -274,13 +291,18 @@ impl Macros {
         s
     }
 
-    pub fn import_text(&mut self, text: &str, append: bool, code_table: u8) {
-        if !append {
-            self.map.clear();
-        }
-        for line in text.lines().skip(1) {
-            let line = line.trim_end_matches('\r');
-            let Some(pos) = line.find(':') else { continue };
+    pub fn import_text(&mut self, text: &str, append: bool, code_table: u8) -> Result<(), &'static str> {
+        let mut imported = Self::default();
+        let mut header = false;
+        for line in text.trim_start_matches('\u{feff}').lines() {
+            if line.starts_with(';') && !line.contains(':') {
+                header |= line.contains("Macro") && line.contains("version=1");
+                continue;
+            }
+            if line.trim().is_empty() {
+                continue;
+            }
+            let Some(pos) = line.find(':') else { return Err("File gõ tắt không hợp lệ.") };
             let (mut name, mut content) = (line[..pos].to_string(), line[pos + 1..].to_string());
             // names starting with ':' (e.g. "::)")
             while name.is_empty() && !content.is_empty() {
@@ -288,20 +310,110 @@ impl Macros {
                 name = format!(":{}", &content[..p]);
                 content = content[p + 1..].to_string();
             }
-            if !name.is_empty() && !self.has(&name, code_table) {
-                self.add(&name, &content, code_table);
+            if name.is_empty() {
+                return Err("File gõ tắt có tên trống.");
+            }
+            if !imported.has(&name, code_table) {
+                imported.add(&name, &content, code_table)?;
             }
         }
+        if imported.map.is_empty() && !header {
+            return Err("File không chứa dữ liệu gõ tắt hợp lệ.");
+        }
+        if append {
+            let extra = imported.map.keys().filter(|k| !self.map.contains_key(*k)).count();
+            if self.map.len() + extra > u16::MAX as usize {
+                return Err("Danh sách không được vượt quá 65.535 gõ tắt.");
+            }
+            let map = Arc::make_mut(&mut self.map);
+            for (key, value) in std::mem::take(Arc::make_mut(&mut imported.map)) {
+                map.entry(key).or_insert(value);
+            }
+        } else {
+            *self = imported;
+        }
+        Ok(())
     }
 }
 
-fn truncate_utf8(s: &str, max: usize) -> &str {
-    if s.len() <= max {
-        return s;
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn invalid_import_keeps_existing_macros() {
+        let mut macros = Macros::default();
+        macros.add("vn", "Việt Nam", 0).unwrap();
+        let before = macros.save_binary();
+        for append in [false, true] {
+            for invalid in ["", "not a macro file", "new:valid\ninvalid line", ":empty name"] {
+                assert!(macros.import_text(invalid, append, 0).is_err());
+                assert_eq!(macros.save_binary(), before);
+            }
+            let oversized = format!("new:valid\nlong:{}", "x".repeat(65_536));
+            assert!(macros.import_text(&oversized, append, 0).is_err());
+            assert_eq!(macros.save_binary(), before);
+        }
     }
-    let mut end = max;
-    while !s.is_char_boundary(end) {
-        end -= 1;
+
+    #[test]
+    fn valid_import_preserves_existing_names_and_accepts_empty_exports() {
+        let mut macros = Macros::default();
+        macros.add("vn", "Việt Nam", 0).unwrap();
+        macros.import_text("\u{feff}; comment\r\nvn:other\r\nbtw:by the way\r\n", true, 0).unwrap();
+        assert!(macros.all().contains(&("vn".into(), "Việt Nam".into())));
+        assert!(macros.has("btw", 0));
+        macros.import_text(&Macros::default().export_text(), false, 0).unwrap();
+        assert!(macros.all().is_empty());
     }
-    &s[..end]
+
+    #[test]
+    fn exported_punctuation_macros_roundtrip() {
+        let mut macros = Macros::default();
+        for pack in PACKS {
+            macros.add_pack(pack, 0).unwrap();
+        }
+        macros.add(";date", "today", 0).unwrap();
+        let mut loaded = Macros::default();
+        loaded.import_text(&macros.export_text(), false, 0).unwrap();
+        assert_eq!(loaded.all(), macros.all());
+    }
+
+    #[test]
+    fn macro_limits_reject_changes_without_truncating_utf8() {
+        let mut macros = Macros::default();
+        let name = format!("{}a", "á".repeat(127));
+        let content = format!("{}a", "á".repeat(32_767));
+        macros.add(&name, &content, 0).unwrap();
+        let before = macros.save_binary();
+        assert!(macros.add(&format!("{name}a"), "x", 0).is_err());
+        assert!(macros.add(&name, &format!("{content}a"), 0).is_err());
+        assert!(macros.add("", "x", 0).is_err());
+        assert_eq!(macros.save_binary(), before);
+        let mut loaded = Macros::default();
+        loaded.load_binary(&before, 0);
+        assert_eq!(loaded.all(), macros.all());
+    }
+
+    #[test]
+    fn macro_count_cannot_overflow_binary_header() {
+        let mut macros = Macros::default();
+        for i in 0..u16::MAX {
+            macros.add(&format!("m{i}"), "x", 0).unwrap();
+        }
+        assert!(macros.add("extra", "x", 0).is_err());
+        macros.add("m0", "updated", 0).unwrap();
+        assert!(macros.import_text("extra:x", true, 0).is_err());
+        assert_eq!(&macros.save_binary()[..2], &u16::MAX.to_le_bytes());
+    }
+
+    #[test]
+    fn editing_a_snapshot_does_not_change_live_macros() {
+        let mut live = Macros::default();
+        live.add("vn", "Việt Nam", 0).unwrap();
+        let mut snapshot = live.clone();
+        snapshot.add("vn", "changed", 0).unwrap();
+        snapshot.add("new", "new", 0).unwrap();
+        assert_eq!(live.all(), vec![("vn".into(), "Việt Nam".into())]);
+    }
 }
